@@ -1,0 +1,12 @@
+# ============================================================
+# Automated Synthetic Data Generator & Model Alignment Pipeline
+# Dependency Matrix — pinned, fully stable versions
+# ============================================================
+
+streamlit==1.32.0
+pydantic==2.6.4
+pydantic-settings==2.2.1
+google-generativeai==0.4.1
+pandas==2.2.1
+plotly==5.19.0
+python-dotenv==1.0.1
