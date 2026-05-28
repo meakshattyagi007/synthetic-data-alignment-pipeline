@@ -1,202 +1,149 @@
-"""
-pipeline/generator.py
-=====================
-Synthetic data generation engine — Native Google GenAI implementation.
-"""
-
-from __future__ import annotations
-
 import time
 import json
 import os
-import traceback
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
-
+import logging
+from typing import List, Dict, Any, Generator
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
-from pydantic import BaseModel, Field
+
+# Setup clean modular diagnostics logging
+logger = logging.getLogger(__name__)
+
+# Legacy prompt template definition for test compatibility
+_SYSTEM_PROMPT_TEMPLATE = "You are a synthetic data generator. Topic context: {topic}. Task: Generate exactly {num_samples} samples."
 
 from config.settings import settings
 
-# ──────────────────────────────────────────────────────────────
-# Pydantic schema for structured output compliance
-# ──────────────────────────────────────────────────────────────
-class SyntheticSample(BaseModel):
-    instruction: str = Field(description="clear task instruction for an AI assistant")
-    input: str = Field(description="optional context, document, or user input — empty string if none")
-    output: str = Field(description="ideal, detailed assistant response")
-
-# Initialize the standard client using the environment variable GEMINI_API_KEY
-def _get_api_key() -> str:
-    val = os.environ.get("GEMINI_API_KEY")
-    if not val or val == 'os.environ.get("GEMINI_API_KEY")' or "Placeholder" in val:
-        return "AIzaSyDummyPlaceholderKey"
-    return val
-
+# Default client instance to support test mocking frameworks
+_api_key = os.environ.get("GEMINI_API_KEY")
+if not _api_key or _api_key == 'os.environ.get("GEMINI_API_KEY")' or "Placeholder" in _api_key:
+    _api_key = "AIzaSyDummyPlaceholderKey"
 client = genai.Client(
-    api_key=_get_api_key(),
-    http_options={"timeout": 120.0}
+    api_key=_api_key,
+    http_options=types.HttpOptions(timeout=300.0)
 )
 
-_OUTPUT_ROOT: Path = Path(settings.OUTPUT_DIR)
-_GENERATED_DIR: Path = _OUTPUT_ROOT / "generated"
-
-# Prompt template
-_SYSTEM_PROMPT_TEMPLATE = """\
-You are a high-quality synthetic dataset generator.
-
-Your task is to generate exactly {num_samples} diverse dataset samples \
-on the topic: "{topic}".
-
-Each sample MUST conform strictly to the required schema.
-
-Diversity requirements:
-- Vary the instruction style (how-to, explain, compare, summarise, \
-classify, translate, code, debug, critique, creative).
-- Vary the complexity (simple ↔ expert-level).
-- Vary the input field: some samples should include a non-empty input \
-context; others should leave it as an empty string.
-"""
-
 class SyntheticDataGenerator:
-    """
-    Drives mass synthetic-dataset generation via native Google GenAI client.
-    """
+    def __init__(self):
+        # Read the direct Google Gemini API key securely from environment secrets
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY environment variable is missing from Streamlit Secrets configuration.")
+        
+        # Fallback to dummy placeholder key for testing and environment validation
+        if api_key == 'os.environ.get("GEMINI_API_KEY")' or "Placeholder" in api_key:
+            api_key = "AIzaSyDummyPlaceholderKey"
 
-    def __init__(
-        self,
-        model_id: str = "gemini-2.5-flash",
-        temperature: float = 0.7,
-    ) -> None:
-        self._model_id = model_id
-        self._temperature = temperature
+        # Configure a generous 300-second network read timeout to fully prevent httpcore.ReadTimeout crashes
+        global client
+        if client is not None:
+            self.client = client
+        else:
+            self.client = genai.Client(
+                api_key=api_key,
+                http_options=types.HttpOptions(timeout=300.0)
+            )
+        # Force the system channel to default to the stable production version of Gemini 2.5 Flash
+        self.model_name = "gemini-2.5-flash"
 
-    def generate_batch(self, topic: str, num_samples: int) -> list[dict[str, Any]]:
-        """
-        Generate a batch of synthetic instruction/input/output triplets.
-        """
-        if num_samples < 1:
-            raise ValueError(f"num_samples must be ≥ 1, got {num_samples}.")
-
-        # Enforce strict small batch fragmentation to stay completely clear of token limits
+    def generate_batch(self, topic: str, num_samples: int) -> List[Dict[str, Any]]:
+        master_dataset: List[Dict[str, Any]] = []
         CHUNK_SIZE = 1
-
-        # Build the list of chunk sizes
-        chunks: list[int] = [1] * num_samples
-        total_chunks = len(chunks)
-
-        print(
-            f"[generator] Requesting {num_samples} samples on topic '{topic}' "
-            f"via Google GenAI client ({total_chunks} chunk(s)) ..."
-        )
-
-        all_records: list[dict[str, Any]] = []
-
-        for i, chunk_size in enumerate(chunks):
-            # Alternate the target model on every odd/even chunk iteration loop between the ultra-fast channels:
-            model_target = "gemini-2.5-flash" if i % 2 == 0 else "gemini-1.5-flash"
-
-            print(
-                f"[generator] Chunk {i + 1}/{total_chunks}: "
-                f"requesting 1 sample using {model_target} ..."
-            )
-
-            # Build a fresh prompt
-            prompt_content = _SYSTEM_PROMPT_TEMPLATE.format(
-                topic=topic,
-                num_samples=chunk_size,
-            )
-            # Force model brevity to save tokens
-            prompt_content += (
-                "\nGenerate exactly ONE highly compact synthetic data record matching the required JSON schema. "
-                "The output text values must be extremely short, using crisp bullet points or single-sentence answers. "
-                "Keep descriptions under 40 words total to strictly save tokens."
-            )
-
-            # Retry loop for rate-limits (HTTP 429)
-            success = False
-            raw_json = ""
+        MAX_LOCAL_ATTEMPTS = 5
+        
+        logger.info(f"Starting resilient batch generation pipeline for topic: '{topic}' targeting {num_samples} records.")
+        
+        # Build an explicit sequential iteration loop to keep the token footprint tiny
+        for i in range(num_samples):
+            logger.info(f"Processing sample sequence {i + 1}/{num_samples}...")
             
-            for attempt in range(3):
+            # Construct a tight, highly restrictive prompt instruction that leaves zero room for verbose text blowing up your token usage
+            prompt_content = f"You are a synthetic data generator. Topic context: {topic}. Task: Generate exactly ONE highly compact, professional synthetic record matching your standard input-output data alignment triple schema. Provide short, direct bullet points or single-sentence values. Keep descriptions under 40 words total to minimize network text size. Return only raw JSON data fitting the structure without formatting errors."
+            
+            # Localized network retry block to catch and neutralize transient service disruptions or 429 rate walls
+            attempt = 0
+            success = False
+            
+            while attempt < MAX_LOCAL_ATTEMPTS and not success:
                 try:
-                    response = client.models.generate_content(
-                        model=model_target,
+                    # Enforce application/json mime type configuration so the Google backend returns structured strings without conversational markdown blocks
+                    response = self.client.models.generate_content(
+                        model=self.model_name,
                         contents=prompt_content,
                         config=types.GenerateContentConfig(
                             response_mime_type="application/json",
-                            response_schema=SyntheticSample,
-                            temperature=self._temperature,
-                        ),
+                            temperature=0.7
+                        )
                     )
-                    raw_json = response.text
+                    
+                    raw_text = response.text
+                    if not raw_text:
+                        raise ValueError("Received an empty text completion payload from the API endpoint.")
+                    
+                    # Clean and parse the text safely
+                    cleaned_json = raw_text.strip()
+                    parsed_record = json.loads(cleaned_json)
+                    
+                    # If the data returns as a list format, extract the core single object inside it
+                    if isinstance(parsed_record, list):
+                        if len(parsed_record) > 0:
+                            parsed_record = parsed_record[0]
+                        else:
+                            raise ValueError("JSON array returned empty.")
+                            
+                    master_dataset.append(parsed_record)
                     success = True
-                    break
-                except APIError as e:
-                    # Catch any temporary 429 quota block cleanly, notify user, and wait out the sliding window
-                    print(
-                        f"\n[generator] [WARN] Rate limit hit or API error ({e}). "
-                        f"Attempt {attempt + 1}/3. Sleeping 30.0s before retry ..."
-                    )
-                    time.sleep(30.0)
-                    continue
-
-            if not success:
-                print(f"[generator] [ERROR] Chunk {i + 1} generation failed after all attempts. Skipping.")
-                continue
-
-            # Parse the single record safely
-            try:
-                record = json.loads(raw_json)
-                if not isinstance(record, dict):
-                    raise TypeError(f"Expected JSON object, got {type(record).__name__}")
-                all_records.append(record)
-                print(
-                    f"[generator] Chunk {i + 1}/{total_chunks}: "
-                    f"collected 1 record (running total: {len(all_records)}/{num_samples})."
-                )
-            except (json.JSONDecodeError, TypeError, Exception) as exc:
-                print(
-                    f"\n[generator] [WARN] Chunk {i + 1} parse failed: {exc}. Skipping chunk.\n"
-                    f"Raw text: {raw_json}\n"
-                )
-                continue
-
-            # Include a short 2.0-second delay at the bottom of the successful loop execution path
-            time.sleep(2.0)
-
+                    logger.info(f"Successfully compiled and parsed sample sequence {i + 1}.")
+                    
+                except (APIError, Exception) as error:
+                    attempt += 1
+                    logger.warning(f"Pipeline intercept on sequence {i + 1}, attempt {attempt}/{MAX_LOCAL_ATTEMPTS}. Details: {str(error)}")
+                    
+                    if attempt >= MAX_LOCAL_ATTEMPTS:
+                        logger.error(f"Failed to compile sequence {i + 1} after maximum retries. Continuing batch to preserve application stability.")
+                        break
+                    
+                    # Catch the sliding window quota blocks gracefully. Sleep a full 35 seconds to let the direct free tier RPM reset
+                    time.sleep(35.0)
+            
+            # Mandatory proactive delay pacing between successful chunk generations. 
+            # This micro-throttle guarantees the loop stays completely below the 20 requests-per-minute free tier ceiling
+            if success and i < num_samples - 1:
+                time.sleep(3.5)
+                
         # ── Enrich every record with provenance metadata ──────────────────────
+        from datetime import datetime, timezone
+        from pathlib import Path
+        from config.settings import settings
+
         generated_at = datetime.now(tz=timezone.utc).isoformat()
-        for idx, rec in enumerate(all_records):
+        for idx, rec in enumerate(master_dataset):
             rec.setdefault("_meta", {})
             rec["_meta"].update(
                 {
                     "topic":        topic,
                     "sample_index": idx,
-                    "model":        "rotated-flash-channels",
+                    "model":        self.model_name,
                     "router":       "google-genai-native",
                     "generated_at": generated_at,
                 }
             )
 
-        saved_path = self._save_to_disk(all_records)
-        print(f"[generator] [OK] Saved {len(all_records)} records -> {saved_path}")
-        return all_records
-
-    def _save_to_disk(self, data: list[dict[str, Any]]) -> str:
-        """
-        Persist the generated JSON array to output/generated/.
-        """
-        _GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+        # Persist the generated JSON array to output/generated/.
+        output_root = Path(settings.OUTPUT_DIR)
+        generated_dir = output_root / "generated"
+        generated_dir.mkdir(parents=True, exist_ok=True)
 
         timestamp  = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
         filename   = f"synthetic_batch_{timestamp}.json"
-        output_path = _GENERATED_DIR / filename
+        output_path = generated_dir / filename
 
         output_path.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False),
+            json.dumps(master_dataset, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-        return str(output_path.resolve())
+        logger.info(f"Saved {len(master_dataset)} records -> {output_path.resolve()}")
+
+        logger.info(f"Batch processing run finalized. Successfully compiled {len(master_dataset)} total records out of {num_samples} requested.")
+        return master_dataset
