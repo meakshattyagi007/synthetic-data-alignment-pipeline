@@ -23,18 +23,32 @@ client = genai.Client(api_key=_api_key)
 
 class SyntheticDataGenerator:
     def __init__(self):
-        # Read the direct Google Gemini API key securely from environment secrets
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY environment variable is missing from Streamlit Secrets configuration.")
+        # Retrieve a comma-separated string of multiple API keys from secrets
+        raw_keys = os.environ.get("GEMINI_API_KEY", "")
+        
+        # Split the string by commas and strip whitespace to build a clean list
+        self.api_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
         
         # Fallback to dummy placeholder key for testing and environment validation
-        if api_key == 'os.environ.get("GEMINI_API_KEY")' or "Placeholder" in api_key:
-            api_key = "AIzaSyDummyPlaceholderKey"
+        for idx, key in enumerate(self.api_keys):
+            if key == 'os.environ.get("GEMINI_API_KEY")' or "Placeholder" in key:
+                self.api_keys[idx] = "AIzaSyDummyPlaceholderKey"
 
-        self.client = genai.Client(api_key=api_key)
-        # Force the system channel to default to the stable production version of Gemini 2.5 Flash
+        if not self.api_keys:
+            raise ValueError("No API keys found. Please configure GEMINI_API_KEY as a comma-separated string in Streamlit Secrets.")
+        
+        self.current_key_index = 0
         self.model_name = "gemini-2.5-flash"
+        
+        # Initialize the default client with the first key in the pool
+        self.client = genai.Client(api_key=self.api_keys[self.current_key_index])
+
+    def _rotate_key(self):
+        if len(self.api_keys) <= 1:
+            return
+        self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+        # Re-initialize the active client instance with the next key credentials
+        self.client = genai.Client(api_key=self.api_keys[self.current_key_index])
 
     def generate_batch(self, topic: str, num_samples: int) -> List[Dict[str, Any]]:
         master_dataset: List[Dict[str, Any]] = []
@@ -109,6 +123,7 @@ class SyntheticDataGenerator:
                         sleep_duration = 65.0
                         
                     logger.info(f"Rate limit backoff initiated. Sleeping pipeline for {sleep_duration} seconds...")
+                    self._rotate_key()
                     time.sleep(sleep_duration)
                 except Exception as error:
                     attempt += 1
@@ -124,6 +139,7 @@ class SyntheticDataGenerator:
             # This micro-throttle guarantees the loop stays completely below the 20 requests-per-minute free tier ceiling
             if success and i < num_samples - 1:
                 time.sleep(3.5)
+            self._rotate_key()
                 
         # ── Enrich every record with provenance metadata ──────────────────────
         from datetime import datetime, timezone
