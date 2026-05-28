@@ -284,7 +284,7 @@ class SyntheticDataGenerator:
                         }
                     ],
                     temperature=self._temperature,
-                    max_tokens=2048,   # Caps OpenRouter credit reservation — avoids 402
+                    max_tokens=4096,  # Plenty of room for 2 large samples; perfectly safe for OpenRouter free balance allocation
                     timeout=120,       # seconds — prevents hanging on slow cloud hops
                 )
                 raw_text: str = completion.choices[0].message.content or ""
