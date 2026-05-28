@@ -56,21 +56,21 @@ class PipelineSettings(BaseSettings):
     )
 
     # ── Required ─────────────────────────────────────────────
-    # Primary routing key — all generation requests go through OpenRouter.
-    OPENROUTER_API_KEY: SecretStr
+    # Native Google Gemini API key
+    GEMINI_API_KEY: SecretStr
 
     # ── Optional (with sensible defaults) ───────────────────
     OUTPUT_DIR: str = "output"
 
     # ── Validators ───────────────────────────────────────────
-    @field_validator("OPENROUTER_API_KEY", mode="before")
+    @field_validator("GEMINI_API_KEY", mode="before")
     @classmethod
     def _api_key_must_not_be_empty(cls, v: object) -> object:
         """Reject an explicitly empty string so callers get a clear error."""
         if isinstance(v, str) and v.strip() == "":
             raise ValueError(
-                "OPENROUTER_API_KEY is set but contains only whitespace. "
-                "Provide a valid OpenRouter API key."
+                "GEMINI_API_KEY is set but contains only whitespace. "
+                "Provide a valid Google Gemini API key."
             )
         return v
 
@@ -96,7 +96,7 @@ def _scrub_secrets(text: str) -> str:
 
     lines = []
     for line in text.splitlines():
-        if "OPENROUTER_API_KEY" in line or "api_key" in line.lower():
+        if "GEMINI_API_KEY" in line or "api_key" in line.lower():
             line = re.sub(r"input_value=['\"][^'\"]*['\"]", "input_value='[REDACTED]'", line)
         lines.append(line)
     return "\n".join(lines)
@@ -118,8 +118,8 @@ except Exception as exc:  # pydantic.ValidationError or similar
 
     print(
         "  Fix: Ensure a .env file exists at the project root containing:\n"
-        "       OPENROUTER_API_KEY=<your-openrouter-key>\n"
-        "  Get your free key at: https://openrouter.ai/keys\n",
+        "       GEMINI_API_KEY=<your-gemini-key>\n"
+        "  Obtain a key at: https://aistudio.google.com/app/apikey\n",
         file=sys.stderr,
     )
     print(_SEPARATOR, file=sys.stderr)
@@ -135,5 +135,5 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
     print("[OK] Environment validation passed.")
     print(f"     OUTPUT_DIR                   : {settings.OUTPUT_DIR}")
-    key_val = settings.OPENROUTER_API_KEY.get_secret_value()
-    print(f"     OPENROUTER_API_KEY (masked)  : {'*' * 8}{key_val[-4:]}")
+    key_val = settings.GEMINI_API_KEY.get_secret_value()
+    print(f"     GEMINI_API_KEY (masked)      : {'*' * 8}{key_val[-4:]}")

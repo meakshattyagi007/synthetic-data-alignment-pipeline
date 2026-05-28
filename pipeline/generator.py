@@ -1,34 +1,7 @@
 """
 pipeline/generator.py
 =====================
-Synthetic data generation engine — Production implementation.
-
-Architecture
-------------
-- Router  : OpenRouter (https://openrouter.ai/api/v1) — OpenAI-compatible
-            REST endpoint.  Routes the request to Gemini 2.5 Flash on the
-            Google backend while bypassing the direct Free Tier 20 RPM cap.
-- Client  : openai Python SDK (v1+) in drop-in compatibility mode.
-- Output  : Prompt-enforced JSON array; markdown fences stripped by
-            _extract_json() before parsing.
-- Storage : output/generated/synthetic_batch_YYYYMMDD_HHMMSS.json
-
-Public surface
---------------
-    SyntheticDataGenerator.generate_batch(topic, num_samples) -> list[dict]
-    SyntheticDataGenerator._save_to_disk(data) -> str   (path returned)
-
-Design invariants
------------------
-- API key sourced exclusively from config.settings — zero raw os.environ
-  reads inside this module.
-- No database connectors; JSON files are the only persistence layer.
-- All errors from the API are caught, printed with a scrubbed traceback,
-  and re-raised so callers can decide recovery strategy.
-- Rate-limit (HTTP 429) errors are caught natively with an exponential
-  back-off retry loop (up to 3 attempts). A proactive 3.5-second inter-
-  call throttle keeps the sustained request rate comfortably under any
-  tier ceiling.
+Synthetic data generation engine — Native Google GenAI implementation.
 """
 
 from __future__ import annotations
@@ -36,60 +9,43 @@ from __future__ import annotations
 import time
 import json
 import os
-import re
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import openai
-from openai import OpenAI, RateLimitError
+from google import genai
+from google.genai import types
+from google.genai.errors import APIError
+from pydantic import BaseModel, Field
 
 from config.settings import settings
 
 # ──────────────────────────────────────────────────────────────
-# OpenRouter client — one instance, module-level singleton.
-# Uses the standard OpenAI-compatible SDK pointed at OpenRouter's
-# base URL.  The API key is sourced from PipelineSettings so it
-# is always validated at boot and never read from os.environ here.
+# Pydantic schema for structured output compliance
 # ──────────────────────────────────────────────────────────────
-_client: OpenAI = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=settings.OPENROUTER_API_KEY.get_secret_value(),
-)
+class SyntheticSample(BaseModel):
+    instruction: str = Field(description="clear task instruction for an AI assistant")
+    input: str = Field(description="optional context, document, or user input — empty string if none")
+    output: str = Field(description="ideal, detailed assistant response")
 
-# ──────────────────────────────────────────────────────────────
-# Constants
-# ──────────────────────────────────────────────────────────────
-# OpenRouter model slug for Gemini 2.5 Flash.
-_MODEL_ID: str = "google/gemini-2.5-flash"
+# Initialize the standard client using the environment variable GEMINI_API_KEY
+client = genai.Client(
+    api_key=os.environ.get("GEMINI_API_KEY"),
+    http_options={"timeout": 120.0}
+)
 
 _OUTPUT_ROOT: Path = Path(settings.OUTPUT_DIR)
 _GENERATED_DIR: Path = _OUTPUT_ROOT / "generated"
 
-# Sampling parameters passed directly in the chat-completion payload.
-_TEMPERATURE: float = 0.7
-
-# ──────────────────────────────────────────────────────────────
 # Prompt template
-# ──────────────────────────────────────────────────────────────
 _SYSTEM_PROMPT_TEMPLATE = """\
 You are a high-quality synthetic dataset generator.
 
 Your task is to generate exactly {num_samples} diverse dataset samples \
 on the topic: "{topic}".
 
-Each sample MUST conform strictly to the following JSON schema:
-
-{{
-  "instruction": "<clear task instruction for an AI assistant>",
-  "input":       "<optional context, document, or user input — empty string if none>",
-  "output":      "<ideal, detailed assistant response>"
-}}
-
-Return ONLY a valid JSON array of exactly {num_samples} objects using \
-the schema above. Do not include any markdown fences, commentary, \
-preamble, or trailing text — raw JSON only.
+Each sample MUST conform strictly to the required schema.
 
 Diversity requirements:
 - Vary the instruction style (how-to, explain, compare, summarise, \
@@ -97,64 +53,24 @@ classify, translate, code, debug, critique, creative).
 - Vary the complexity (simple ↔ expert-level).
 - Vary the input field: some samples should include a non-empty input \
 context; others should leave it as an empty string.
-- All outputs must be substantive (≥ 40 words).
 """
-
 
 class SyntheticDataGenerator:
     """
-    Drives mass synthetic-dataset generation via OpenRouter → Gemini 2.5 Flash.
-
-    Parameters
-    ----------
-    model_id : str
-        OpenRouter model slug to target.
-        Defaults to ``google/gemini-2.5-flash-preview``.
-    temperature : float
-        Sampling temperature passed to the chat-completion API.
-        Defaults to ``0.7``.
+    Drives mass synthetic-dataset generation via native Google GenAI client.
     """
 
     def __init__(
         self,
-        model_id: str = _MODEL_ID,
-        temperature: float = _TEMPERATURE,
+        model_id: str = "gemini-2.5-flash",
+        temperature: float = 0.7,
     ) -> None:
-        self._model_id   = model_id
+        self._model_id = model_id
         self._temperature = temperature
-
-    # ── Public API ────────────────────────────────────────────
 
     def generate_batch(self, topic: str, num_samples: int) -> list[dict[str, Any]]:
         """
         Generate a batch of synthetic instruction/input/output triplets.
-
-        Splits ``num_samples`` into mini-chunks of ``CHUNK_SIZE`` samples each
-        and issues one API call per chunk. This keeps every response well within
-        the ``max_tokens`` window, eliminating ``JSONDecodeError`` truncation on
-        large requests.  The existing rate-limit retry policy and proactive
-        throttle are applied to every chunk call.
-
-        Parameters
-        ----------
-        topic : str
-            Subject domain for the synthetic samples
-            (e.g. ``"Python asyncio programming"``).
-        num_samples : int
-            Total number of samples to generate.  Must be ≥ 1.
-
-        Returns
-        -------
-        list[dict[str, Any]]
-            Parsed list of ``{"instruction", "input", "output"}`` dicts,
-            enriched with ``_meta`` provenance fields.
-
-        Raises
-        ------
-        ValueError
-            If ``num_samples`` < 1.
-        Exception
-            Re-raises any API exception after printing a scrubbed traceback.
         """
         if num_samples < 1:
             raise ValueError(f"num_samples must be ≥ 1, got {num_samples}.")
@@ -162,82 +78,88 @@ class SyntheticDataGenerator:
         # Enforce strict small batch fragmentation to stay completely clear of token limits
         CHUNK_SIZE = 1
 
-        # Build the list of chunk sizes: e.g. num_samples=7 → [2, 2, 2, 1]
-        chunks: list[int] = []
-        remaining = num_samples
-        while remaining > 0:
-            chunk = min(CHUNK_SIZE, remaining)
-            chunks.append(chunk)
-            remaining -= chunk
-
+        # Build the list of chunk sizes
+        chunks: list[int] = [1] * num_samples
         total_chunks = len(chunks)
+
         print(
             f"[generator] Requesting {num_samples} samples on topic '{topic}' "
-            f"via OpenRouter -> {self._model_id} "
-            f"({total_chunks} chunk(s) of <={CHUNK_SIZE} each) ..."
+            f"via Google GenAI client ({total_chunks} chunk(s)) ..."
         )
 
-        # ── Accumulate results across chunks ─────────────────────────────────
         all_records: list[dict[str, Any]] = []
 
-        for chunk_idx, chunk_size in enumerate(chunks, start=1):
+        for i, chunk_size in enumerate(chunks):
+            # Alternate the target model on every odd/even chunk iteration loop between the ultra-fast channels:
+            model_target = "gemini-2.5-flash" if i % 2 == 0 else "gemini-1.5-flash"
+
             print(
-                f"[generator] Chunk {chunk_idx}/{total_chunks}: "
-                f"requesting {chunk_size} sample(s) ..."
+                f"[generator] Chunk {i + 1}/{total_chunks}: "
+                f"requesting 1 sample using {model_target} ..."
             )
 
-            # Build a fresh prompt for this exact chunk size so the model
-            # knows precisely how many objects to emit.
-            chunk_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
+            # Build a fresh prompt
+            prompt_content = _SYSTEM_PROMPT_TEMPLATE.format(
                 topic=topic,
                 num_samples=chunk_size,
             )
-            # Force model brevity to strictly save tokens and fit within window
-            chunk_prompt += (
+            # Force model brevity to save tokens
+            prompt_content += (
                 "\nGenerate exactly ONE highly compact synthetic data record matching the required JSON schema. "
                 "The output text values must be extremely short, using crisp bullet points or single-sentence answers. "
                 "Keep descriptions under 40 words total to strictly save tokens."
             )
 
-            # Delegate the API call (with retry + throttle) to the helper.
-            raw_text = self._call_api_with_retry(chunk_prompt)
-
-            raw_json = raw_text
-
-            cleaned_json = raw_json.strip()
-            if cleaned_json.startswith("```"):
-                cleaned_json = "\n".join(cleaned_json.split("\n")[1:])
-                if cleaned_json.endswith("```"):
-                    cleaned_json = cleaned_json[:-3]
-            cleaned_json = cleaned_json.strip()
-
-            if not cleaned_json.endswith("}"):
-                if cleaned_json.count('"') % 2 != 0:
-                    cleaned_json += '"'
-                cleaned_json += "}"
-
-            # Parse this chunk's JSON
-            try:
-                chunk_records = json.loads(cleaned_json)
-                if isinstance(chunk_records, dict):
-                    chunk_records = [chunk_records]
-                if not isinstance(chunk_records, list):
-                    raise TypeError(
-                        f"Expected JSON array or object, got {type(chunk_records).__name__}"
+            # Retry loop for rate-limits (HTTP 429)
+            success = False
+            raw_json = ""
+            
+            for attempt in range(3):
+                try:
+                    response = client.models.generate_content(
+                        model=model_target,
+                        contents=prompt_content,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=SyntheticSample,
+                            temperature=self._temperature,
+                        ),
                     )
+                    raw_json = response.text
+                    success = True
+                    break
+                except APIError as e:
+                    # Catch any temporary 429 quota block cleanly, notify user, and wait out the sliding window
+                    print(
+                        f"\n[generator] [WARN] Rate limit hit or API error ({e}). "
+                        f"Attempt {attempt + 1}/3. Sleeping 30.0s before retry ..."
+                    )
+                    time.sleep(30.0)
+                    continue
 
-                all_records.extend(chunk_records)
+            if not success:
+                print(f"[generator] [ERROR] Chunk {i + 1} generation failed after all attempts. Skipping.")
+                continue
+
+            # Parse the single record safely
+            try:
+                record = json.loads(raw_json)
+                if not isinstance(record, dict):
+                    raise TypeError(f"Expected JSON object, got {type(record).__name__}")
+                all_records.append(record)
                 print(
-                    f"[generator] Chunk {chunk_idx}/{total_chunks}: "
-                    f"collected {len(chunk_records)} record(s) "
-                    f"(running total: {len(all_records)}/{num_samples})."
+                    f"[generator] Chunk {i + 1}/{total_chunks}: "
+                    f"collected 1 record (running total: {len(all_records)}/{num_samples})."
                 )
             except (json.JSONDecodeError, TypeError, Exception) as exc:
                 print(
-                    f"\n[generator] [WARN] Chunk {chunk_idx} parse or processing failed: {exc}. Skipping chunk.\n"
-                    f"Raw text (first 500 chars): {raw_text[:500]}\n"
+                    f"\n[generator] [WARN] Chunk {i + 1} parse failed: {exc}. Skipping chunk.\n"
+                    f"Raw text: {raw_json}\n"
                 )
                 continue
+
+            # Include a short 2.0-second delay at the bottom of the successful loop execution path
+            time.sleep(2.0)
 
         # ── Enrich every record with provenance metadata ──────────────────────
         generated_at = datetime.now(tz=timezone.utc).isoformat()
@@ -247,8 +169,8 @@ class SyntheticDataGenerator:
                 {
                     "topic":        topic,
                     "sample_index": idx,
-                    "model":        self._model_id,
-                    "router":       "openrouter.ai",
+                    "model":        "rotated-flash-channels",
+                    "router":       "google-genai-native",
                     "generated_at": generated_at,
                 }
             )
@@ -257,141 +179,9 @@ class SyntheticDataGenerator:
         print(f"[generator] [OK] Saved {len(all_records)} records -> {saved_path}")
         return all_records
 
-    # ── Private helpers ───────────────────────────────────────
-
-    def _call_api_with_retry(self, prompt: str) -> str:
-        """
-        Issue a single chat-completion request to OpenRouter with retry logic.
-
-        Handles ``RateLimitError`` (HTTP 429) with exponential back-off (up to
-        3 attempts) and applies a proactive 3.5-second throttle after every
-        successful response to keep the sustained request rate under any tier
-        ceiling.
-
-        Parameters
-        ----------
-        prompt : str
-            The fully-formatted user prompt to send.
-
-        Returns
-        -------
-        str
-            The raw text content returned by the model.
-
-        Raises
-        ------
-        RateLimitError
-            After ``_MAX_RETRIES`` consecutive 429 responses.
-        Exception
-            Any other API error, re-raised after printing a scrubbed traceback.
-        """
-        _MAX_RETRIES:             int   = 3
-        _DEFAULT_RATE_LIMIT_SLEEP: float = 60.0  # seconds to wait on 429
-        _PROACTIVE_THROTTLE:      float = 3.5   # seconds between successful calls
-
-        attempt: int = 0
-
-        while attempt < _MAX_RETRIES:
-            try:
-                completion = _client.chat.completions.create(
-                    model="google/gemini-2.5-flash",
-                    messages=[{"role": "user", "content": prompt}],
-                    response_format={"type": "json_object"},
-                    max_tokens=350,
-                )
-                raw_text: str = completion.choices[0].message.content or ""
-
-                # Proactive throttle — keeps sustained RPM under the tier cap.
-                print(
-                    f"[generator] [THROTTLE] Sleeping {_PROACTIVE_THROTTLE}s "
-                    f"to stay under rate-limit ceiling ..."
-                )
-                time.sleep(_PROACTIVE_THROTTLE)
-                return raw_text  # ← success
-
-            except openai.RateLimitError as exc:
-                attempt += 1
-                # Extract server-suggested delay (e.g. "Retry after 30s").
-                delay_match = re.search(r"(\d+)\s*s", str(exc))
-                sleep_for = (
-                    float(delay_match.group(1)) if delay_match
-                    else _DEFAULT_RATE_LIMIT_SLEEP
-                )
-                print(
-                    f"\n[generator] [WARN] Rate limit hit (429 RateLimitError). "
-                    f"Attempt {attempt}/{_MAX_RETRIES}. "
-                    f"Sleeping {sleep_for:.0f}s before retry ..."
-                )
-                time.sleep(sleep_for)
-
-                if attempt >= _MAX_RETRIES:
-                    print("[generator] [ERROR] Max retries reached on RateLimitError. Aborting.")
-                    raise
-
-            except Exception:
-                print("\n[generator] [ERROR] OpenRouter API call failed:")
-                tb_str = traceback.format_exc()
-                scrubbed_tb = re.sub(
-                    r"sk-or-[A-Za-z0-9\-_]{10,80}", "[REDACTED_API_KEY]", tb_str
-                )
-                print(scrubbed_tb)
-                raise
-
-        # Unreachable — the loop always returns or raises.
-        raise RuntimeError("_call_api_with_retry exited without returning.")  # pragma: no cover
-
-
-    @staticmethod
-    def _extract_json(text: str) -> str:
-        """
-        Extract the raw JSON payload from a model response.
-
-        The model sometimes wraps its output in a markdown code fence
-        (```json ... ``` or ``` ... ```) even when the prompt says not to.
-        This method strips any such fencing and returns the bare JSON string.
-
-        Strategy
-        --------
-        1. Look for a fenced block starting with ```json or ```.
-        2. If found, extract only the content between the opening and
-           closing fence markers.
-        3. If no fence is found, return the text stripped of leading/
-           trailing whitespace — the model likely returned raw JSON.
-        """
-        stripped = text.strip()
-
-        # Pattern: optional language tag after opening fence
-        if stripped.startswith("```"):
-            # Drop the first line (``` or ```json)
-            lines = stripped.splitlines()
-            # Find closing fence
-            end_idx: int | None = None
-            for i in range(len(lines) - 1, 0, -1):
-                if lines[i].strip() == "```":
-                    end_idx = i
-                    break
-            if end_idx is not None:
-                return "\n".join(lines[1:end_idx]).strip()
-            # No closing fence — drop only the opening line
-            return "\n".join(lines[1:]).strip()
-
-        return stripped
-
     def _save_to_disk(self, data: list[dict[str, Any]]) -> str:
         """
-        Persist the generated JSON array to ``output/generated/``.
-
-        Creates the directory tree if it does not already exist.
-
-        Parameters
-        ----------
-        data : list[dict[str, Any]]
-            The fully-populated list of synthetic records to serialise.
-
-        Returns
-        -------
-        str
-            Absolute path to the written JSON file as a string.
+        Persist the generated JSON array to output/generated/.
         """
         _GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 
