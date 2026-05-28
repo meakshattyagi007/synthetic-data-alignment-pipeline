@@ -28,6 +28,7 @@ Design invariants
 from __future__ import annotations
 
 import json
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,7 @@ from typing import Any
 
 import google.generativeai as genai
 from google.api_core import retry
+from google.api_core.exceptions import ResourceExhausted
 
 from config.settings import settings
 
@@ -173,34 +175,62 @@ class SyntheticDataGenerator:
             f"on topic '{topic}' from {self._model_id} ..."
         )
 
-        # Retry policy: up to 3 attempts with exponential backoff, capped at 60s
-        # between retries. Retries on DeadlineExceeded and ServiceUnavailable,
-        # which occur on Streamlit Cloud during heavy structural JSON generation.
-        _retry_policy = retry.Retry(
-            predicate=retry.if_exception_type(
-                Exception,  # broad catch; generator re-raises on non-retryable failures
-            ),
-            initial=2.0,       # first backoff: 2 seconds
-            maximum=60.0,      # cap each wait at 60 seconds
-            multiplier=2.0,    # double the wait on each successive retry
-            deadline=360.0,    # give up entirely after 6 minutes total
-        )
+        # ── Rate-limit-aware generation with exponential back-off ────────────
+        # Gemini Free Tier cap: 20 RPM.  On a ResourceExhausted (HTTP 429) we
+        # sleep for the delay reported in the error (default: 60 s) then retry.
+        # A proactive 3.5-second throttle after every successful call keeps the
+        # sustained request rate well below the 20 RPM ceiling.
+        _MAX_RETRIES: int = 3
+        _DEFAULT_RATE_LIMIT_SLEEP: float = 60.0   # seconds to wait on 429
+        _PROACTIVE_THROTTLE:       float = 3.5    # seconds between successful calls
 
-        try:
-            response = self._model.generate_content(
-                prompt,
-                generation_config=self._generation_config,
-                request_options={"timeout": 120},  # 120-second per-request timeout
-            )
-            raw_text: str = response.text
-        except Exception:
-            import re
-            print("\n[generator] [ERROR] Gemini API call failed:")
-            tb_str = traceback.format_exc()
-            # Scrub any Google API key pattern (e.g. AIzaSy...)
-            scrubbed_tb = re.sub(r"AIzaSy[A-Za-z0-9_\-]{10,50}", "[REDACTED_API_KEY]", tb_str)
-            print(scrubbed_tb)
-            raise
+        raw_text: str = ""
+        attempt: int = 0
+        while attempt < _MAX_RETRIES:
+            try:
+                response = self._model.generate_content(
+                    prompt,
+                    generation_config=self._generation_config,
+                    request_options={"timeout": 120},  # per-request gRPC deadline
+                )
+                raw_text = response.text
+
+                # Proactive throttle — keeps sustained RPM under the free-tier cap.
+                print(
+                    f"[generator] [THROTTLE] Sleeping {_PROACTIVE_THROTTLE}s "
+                    f"to stay under 20 RPM free-tier cap ..."
+                )
+                time.sleep(_PROACTIVE_THROTTLE)
+                break  # success — exit the retry loop
+
+            except ResourceExhausted as exc:
+                attempt += 1
+                # Try to read the server-suggested retry delay from the error
+                # message (format: "Retry after Xs").  Fall back to 60 s.
+                import re as _re
+                delay_match = _re.search(r"(\d+)\s*s", str(exc))
+                sleep_for = float(delay_match.group(1)) if delay_match else _DEFAULT_RATE_LIMIT_SLEEP
+
+                print(
+                    f"\n[generator] [WARN] Rate limit hit (429 ResourceExhausted). "
+                    f"Attempt {attempt}/{_MAX_RETRIES}. "
+                    f"Sleeping {sleep_for:.0f}s before retry ..."
+                )
+                time.sleep(sleep_for)
+
+                if attempt >= _MAX_RETRIES:
+                    print("[generator] [ERROR] Max retries reached on ResourceExhausted. Aborting.")
+                    raise
+
+            except Exception:
+                import re as _re
+                print("\n[generator] [ERROR] Gemini API call failed:")
+                tb_str = traceback.format_exc()
+                scrubbed_tb = _re.sub(
+                    r"AIzaSy[A-Za-z0-9_\-]{10,50}", "[REDACTED_API_KEY]", tb_str
+                )
+                print(scrubbed_tb)
+                raise
 
         # Strip markdown fences the model may wrap around the JSON array.
         # This is necessary because we cannot use response_mime_type in
