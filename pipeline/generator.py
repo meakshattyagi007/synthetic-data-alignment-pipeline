@@ -30,8 +30,14 @@ class SyntheticSample(BaseModel):
     output: str = Field(description="ideal, detailed assistant response")
 
 # Initialize the standard client using the environment variable GEMINI_API_KEY
+def _get_api_key() -> str:
+    val = os.environ.get("GEMINI_API_KEY")
+    if not val or val == 'os.environ.get("GEMINI_API_KEY")' or "Placeholder" in val:
+        return "AIzaSyDummyPlaceholderKey"
+    return val
+
 client = genai.Client(
-    api_key=os.environ.get("GEMINI_API_KEY"),
+    api_key=_get_api_key(),
     http_options={"timeout": 120.0}
 )
 
