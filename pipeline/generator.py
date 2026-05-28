@@ -5,10 +5,12 @@ Synthetic data generation engine — Production implementation.
 
 Architecture
 ------------
-- Model   : gemini-2.5-flash (high-throughput, low-latency)
+- Router  : OpenRouter (https://openrouter.ai/api/v1) — OpenAI-compatible
+            REST endpoint.  Routes the request to Gemini 2.5 Flash on the
+            Google backend while bypassing the direct Free Tier 20 RPM cap.
+- Client  : openai Python SDK (v1+) in drop-in compatibility mode.
 - Output  : Prompt-enforced JSON array; markdown fences stripped by
-            _extract_json() before parsing — works with SDK 0.4.1 which
-            does not support response_mime_type in its protobuf schema.
+            _extract_json() before parsing.
 - Storage : output/generated/synthetic_batch_YYYYMMDD_HHMMSS.json
 
 Public surface
@@ -18,57 +20,53 @@ Public surface
 
 Design invariants
 -----------------
-- API key sourced exclusively from config.settings — zero direct
-  os.environ reads inside this module.
+- API key sourced exclusively from config.settings — zero raw os.environ
+  reads inside this module.
 - No database connectors; JSON files are the only persistence layer.
-- All errors from the Gemini API are caught, printed with a full
-  traceback, and re-raised so callers can decide recovery strategy.
+- All errors from the API are caught, printed with a scrubbed traceback,
+  and re-raised so callers can decide recovery strategy.
+- Rate-limit (HTTP 429) errors are caught natively with an exponential
+  back-off retry loop (up to 3 attempts). A proactive 3.5-second inter-
+  call throttle keeps the sustained request rate comfortably under any
+  tier ceiling.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import google.generativeai as genai
-from google.api_core import retry
-from google.api_core.exceptions import ResourceExhausted
+from openai import OpenAI, RateLimitError
 
 from config.settings import settings
 
 # ──────────────────────────────────────────────────────────────
-# One-time SDK authentication  (module-level, runs on first import)
+# OpenRouter client — one instance, module-level singleton.
+# Uses the standard OpenAI-compatible SDK pointed at OpenRouter's
+# base URL.  The API key is sourced from PipelineSettings so it
+# is always validated at boot and never read from os.environ here.
 # ──────────────────────────────────────────────────────────────
-genai.configure(api_key=settings.GEMINI_API_KEY.get_secret_value())
+_client: OpenAI = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=settings.OPENROUTER_API_KEY.get_secret_value(),
+)
 
 # ──────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────
-_MODEL_ID: str = "gemini-2.5-flash"
+# OpenRouter model slug for Gemini 2.5 Flash (free-tier route).
+_MODEL_ID: str = "google/gemini-2.5-flash-preview"
 
 _OUTPUT_ROOT: Path = Path(settings.OUTPUT_DIR)
 _GENERATED_DIR: Path = _OUTPUT_ROOT / "generated"
 
-# ──────────────────────────────────────────────────────────────
-# Generation config
-#
-# genai.types.GenerationConfig is the correct typed SDK object in
-# google-generativeai 0.4.1. It is passed as an object instance
-# (not a dict) directly to generate_content(); this avoids the
-# proto marshaller path (to_proto) that rejects unknown field names.
-#
-# response_mime_type does NOT exist in the 0.4.1 protobuf schema
-# and causes a hard ValueError if included in any dict or mapping
-# passed to the API. JSON output is enforced through prompt
-# instructions + the _extract_json() fence-stripping helper instead.
-# ──────────────────────────────────────────────────────────────
-_GENERATION_CONFIG: genai.types.GenerationConfig = genai.types.GenerationConfig(
-    temperature=0.7,
-)
+# Sampling parameters passed directly in the chat-completion payload.
+_TEMPERATURE: float = 0.7
 
 # ──────────────────────────────────────────────────────────────
 # Prompt template
@@ -103,33 +101,25 @@ context; others should leave it as an empty string.
 
 class SyntheticDataGenerator:
     """
-    Drives mass synthetic-dataset generation via the Gemini API.
+    Drives mass synthetic-dataset generation via OpenRouter → Gemini 2.5 Flash.
 
     Parameters
     ----------
     model_id : str
-        Gemini model to target. Defaults to ``gemini-2.5-flash``.
-    generation_config : genai.types.GenerationConfig | None
-        Override the module-level sampling config. Passed as a typed
-        object to ``generate_content()`` to avoid the proto-marshaller
-        path that rejects unknown field names.
+        OpenRouter model slug to target.
+        Defaults to ``google/gemini-2.5-flash-preview``.
+    temperature : float
+        Sampling temperature passed to the chat-completion API.
+        Defaults to ``0.7``.
     """
 
     def __init__(
         self,
         model_id: str = _MODEL_ID,
-        generation_config: genai.types.GenerationConfig | None = None,
+        temperature: float = _TEMPERATURE,
     ) -> None:
-        self._model_id = model_id
-
-        # Store as typed SDK object — passed directly to generate_content()
-        # so the SDK uses its Python-level handling, not the proto marshaller.
-        self._generation_config: genai.types.GenerationConfig = (
-            generation_config if generation_config is not None
-            else _GENERATION_CONFIG
-        )
-
-        self._model = genai.GenerativeModel(model_name=self._model_id)
+        self._model_id   = model_id
+        self._temperature = temperature
 
     # ── Public API ────────────────────────────────────────────
 
@@ -139,7 +129,8 @@ class SyntheticDataGenerator:
 
         Constructs a structured system prompt that constrains the model to
         return a valid JSON array conforming to the triplet schema, then
-        calls the Gemini API, parses the response, and persists the results.
+        calls the OpenRouter API (OpenAI-compatible), parses the response,
+        and persists the results to disk.
 
         Parameters
         ----------
@@ -160,7 +151,7 @@ class SyntheticDataGenerator:
         ValueError
             If ``num_samples`` < 1.
         Exception
-            Re-raises any Gemini API exception after printing a traceback.
+            Re-raises any API exception after printing a scrubbed traceback.
         """
         if num_samples < 1:
             raise ValueError(f"num_samples must be ≥ 1, got {num_samples}.")
@@ -172,69 +163,73 @@ class SyntheticDataGenerator:
 
         print(
             f"[generator] Requesting {num_samples} samples "
-            f"on topic '{topic}' from {self._model_id} ..."
+            f"on topic '{topic}' via OpenRouter -> {self._model_id} ..."
         )
 
         # ── Rate-limit-aware generation with exponential back-off ────────────
-        # Gemini Free Tier cap: 20 RPM.  On a ResourceExhausted (HTTP 429) we
-        # sleep for the delay reported in the error (default: 60 s) then retry.
-        # A proactive 3.5-second throttle after every successful call keeps the
-        # sustained request rate well below the 20 RPM ceiling.
-        _MAX_RETRIES: int = 3
-        _DEFAULT_RATE_LIMIT_SLEEP: float = 60.0   # seconds to wait on 429
-        _PROACTIVE_THROTTLE:       float = 3.5    # seconds between successful calls
+        # HTTP 429 (RateLimitError) is caught natively.  The server-suggested
+        # retry delay is parsed from the error message; if absent we default
+        # to 60 s.  A proactive 3.5-second inter-call throttle is applied
+        # after every successful response to stay under any tier ceiling.
+        _MAX_RETRIES:            int   = 3
+        _DEFAULT_RATE_LIMIT_SLEEP: float = 60.0  # seconds to wait on 429
+        _PROACTIVE_THROTTLE:     float = 3.5   # seconds between successful calls
 
         raw_text: str = ""
-        attempt: int = 0
+        attempt:  int = 0
+
         while attempt < _MAX_RETRIES:
             try:
-                response = self._model.generate_content(
-                    prompt,
-                    generation_config=self._generation_config,
-                    request_options={"timeout": 120},  # per-request gRPC deadline
+                completion = _client.chat.completions.create(
+                    model=self._model_id,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": prompt,
+                        }
+                    ],
+                    temperature=self._temperature,
+                    timeout=120,  # seconds — prevents hanging on slow cloud hops
                 )
-                raw_text = response.text
+                raw_text = completion.choices[0].message.content or ""
 
-                # Proactive throttle — keeps sustained RPM under the free-tier cap.
+                # Proactive throttle — keeps sustained RPM under the tier cap.
                 print(
                     f"[generator] [THROTTLE] Sleeping {_PROACTIVE_THROTTLE}s "
-                    f"to stay under 20 RPM free-tier cap ..."
+                    f"to stay under rate-limit ceiling ..."
                 )
                 time.sleep(_PROACTIVE_THROTTLE)
                 break  # success — exit the retry loop
 
-            except ResourceExhausted as exc:
+            except RateLimitError as exc:
                 attempt += 1
-                # Try to read the server-suggested retry delay from the error
-                # message (format: "Retry after Xs").  Fall back to 60 s.
-                import re as _re
-                delay_match = _re.search(r"(\d+)\s*s", str(exc))
+                # Extract server-suggested delay (e.g. "Retry after 30s").
+                delay_match = re.search(r"(\d+)\s*s", str(exc))
                 sleep_for = float(delay_match.group(1)) if delay_match else _DEFAULT_RATE_LIMIT_SLEEP
 
                 print(
-                    f"\n[generator] [WARN] Rate limit hit (429 ResourceExhausted). "
+                    f"\n[generator] [WARN] Rate limit hit (429 RateLimitError). "
                     f"Attempt {attempt}/{_MAX_RETRIES}. "
                     f"Sleeping {sleep_for:.0f}s before retry ..."
                 )
                 time.sleep(sleep_for)
 
                 if attempt >= _MAX_RETRIES:
-                    print("[generator] [ERROR] Max retries reached on ResourceExhausted. Aborting.")
+                    print("[generator] [ERROR] Max retries reached on RateLimitError. Aborting.")
                     raise
 
             except Exception:
-                import re as _re
-                print("\n[generator] [ERROR] Gemini API call failed:")
+                print("\n[generator] [ERROR] OpenRouter API call failed:")
                 tb_str = traceback.format_exc()
-                scrubbed_tb = _re.sub(
-                    r"AIzaSy[A-Za-z0-9_\-]{10,50}", "[REDACTED_API_KEY]", tb_str
+                # Scrub any accidental key leakage from tracebacks.
+                scrubbed_tb = re.sub(
+                    r"sk-or-[A-Za-z0-9\-_]{10,80}", "[REDACTED_API_KEY]", tb_str
                 )
                 print(scrubbed_tb)
                 raise
 
-        # Strip markdown fences the model may wrap around the JSON array.
-        # This is necessary because we cannot use response_mime_type in
-        # SDK 0.4.1 to enforce bare JSON output at the protocol level.
+        # Strip markdown fences the model may wrap around the JSON array
+        # even when the prompt explicitly asks for raw JSON.
         raw_json: str = self._extract_json(raw_text)
 
         # Parse the JSON array returned by the model.
@@ -259,9 +254,10 @@ class SyntheticDataGenerator:
             rec.setdefault("_meta", {})
             rec["_meta"].update(
                 {
-                    "topic": topic,
+                    "topic":        topic,
                     "sample_index": idx,
-                    "model": self._model_id,
+                    "model":        self._model_id,
+                    "router":       "openrouter.ai",
                     "generated_at": generated_at,
                 }
             )
@@ -326,8 +322,8 @@ class SyntheticDataGenerator:
         """
         _GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 
-        timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
-        filename = f"synthetic_batch_{timestamp}.json"
+        timestamp  = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+        filename   = f"synthetic_batch_{timestamp}.json"
         output_path = _GENERATED_DIR / filename
 
         output_path.write_text(

@@ -7,12 +7,12 @@ Boot behaviour
 --------------
 - Loads .env from the project root (absolute path resolved at import time).
 - Validates all required fields immediately via Pydantic Settings.
-- If GEMINI_API_KEY is absent or empty the process crashes with a
+- If OPENROUTER_API_KEY is absent or empty the process crashes with a
   human-readable stdout message — no silent failures.
 
 Usage (anywhere in the project):
     from config.settings import settings
-    key = settings.GEMINI_API_KEY.get_secret_value()
+    key = settings.OPENROUTER_API_KEY.get_secret_value()
 """
 
 from __future__ import annotations
@@ -56,20 +56,21 @@ class PipelineSettings(BaseSettings):
     )
 
     # ── Required ─────────────────────────────────────────────
-    GEMINI_API_KEY: SecretStr
+    # Primary routing key — all generation requests go through OpenRouter.
+    OPENROUTER_API_KEY: SecretStr
 
     # ── Optional (with sensible defaults) ───────────────────
     OUTPUT_DIR: str = "output"
 
     # ── Validators ───────────────────────────────────────────
-    @field_validator("GEMINI_API_KEY", mode="before")
+    @field_validator("OPENROUTER_API_KEY", mode="before")
     @classmethod
     def _api_key_must_not_be_empty(cls, v: object) -> object:
         """Reject an explicitly empty string so callers get a clear error."""
         if isinstance(v, str) and v.strip() == "":
             raise ValueError(
-                "GEMINI_API_KEY is set but contains only whitespace. "
-                "Provide a valid API key."
+                "OPENROUTER_API_KEY is set but contains only whitespace. "
+                "Provide a valid OpenRouter API key."
             )
         return v
 
@@ -86,15 +87,16 @@ class PipelineSettings(BaseSettings):
 # Instantiate — crash loudly on validation failure.
 # ──────────────────────────────────────────────────────────────
 def _scrub_secrets(text: str) -> str:
-    """Scrub Google API key patterns and validation input values from error output."""
+    """Scrub OpenRouter/Google API key patterns from error output."""
     import re
-    # Mask any string starting with AIzaSy
+    # Mask OpenRouter keys (sk-or-...)
+    text = re.sub(r"sk-or-[A-Za-z0-9\-_]{10,80}", "[REDACTED_API_KEY]", text)
+    # Mask any residual Google-style keys (AIzaSy...)
     text = re.sub(r"AIzaSy[A-Za-z0-9_\-]{10,50}", "[REDACTED_API_KEY]", text)
-    
-    # Mask raw input values on lines referencing sensitive keys
+
     lines = []
     for line in text.splitlines():
-        if "GEMINI_API_KEY" in line or "api_key" in line.lower():
+        if "OPENROUTER_API_KEY" in line or "api_key" in line.lower():
             line = re.sub(r"input_value=['\"][^'\"]*['\"]", "input_value='[REDACTED]'", line)
         lines.append(line)
     return "\n".join(lines)
@@ -110,14 +112,14 @@ except Exception as exc:  # pydantic.ValidationError or similar
     print(_SEPARATOR, file=sys.stderr)
     print("  [BOOT FAILURE] PIPELINE BOOT FAILURE -- Environment Validation Error", file=sys.stderr)
     print(_SEPARATOR, file=sys.stderr)
-    
-    # Securely scrub any secrets in the exception string representation before printing
+
     scrubbed_exc = _scrub_secrets(str(exc))
     print(f"\n{scrubbed_exc}\n", file=sys.stderr)
-    
+
     print(
         "  Fix: Ensure a .env file exists at the project root containing:\n"
-        "       GEMINI_API_KEY=<your-google-ai-studio-key>\n",
+        "       OPENROUTER_API_KEY=<your-openrouter-key>\n"
+        "  Get your free key at: https://openrouter.ai/keys\n",
         file=sys.stderr,
     )
     print(_SEPARATOR, file=sys.stderr)
@@ -132,5 +134,6 @@ if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
     print("[OK] Environment validation passed.")
-    print(f"     OUTPUT_DIR             : {settings.OUTPUT_DIR}")
-    print(f"     GEMINI_API_KEY (masked): {'*' * 8}{settings.GEMINI_API_KEY.get_secret_value()[-4:]}")
+    print(f"     OUTPUT_DIR                   : {settings.OUTPUT_DIR}")
+    key_val = settings.OPENROUTER_API_KEY.get_secret_value()
+    print(f"     OPENROUTER_API_KEY (masked)  : {'*' * 8}{key_val[-4:]}")
