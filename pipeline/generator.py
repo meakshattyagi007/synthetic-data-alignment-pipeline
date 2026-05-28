@@ -19,10 +19,7 @@ from config.settings import settings
 _api_key = os.environ.get("GEMINI_API_KEY")
 if not _api_key or _api_key == 'os.environ.get("GEMINI_API_KEY")' or "Placeholder" in _api_key:
     _api_key = "AIzaSyDummyPlaceholderKey"
-client = genai.Client(
-    api_key=_api_key,
-    http_options=types.HttpOptions(timeout=300.0)
-)
+client = genai.Client(api_key=_api_key)
 
 class SyntheticDataGenerator:
     def __init__(self):
@@ -40,10 +37,7 @@ class SyntheticDataGenerator:
         if client is not None:
             self.client = client
         else:
-            self.client = genai.Client(
-                api_key=api_key,
-                http_options=types.HttpOptions(timeout=300.0)
-            )
+            self.client = genai.Client(api_key=api_key)
         # Force the system channel to default to the stable production version of Gemini 2.5 Flash
         self.model_name = "gemini-2.5-flash"
 
