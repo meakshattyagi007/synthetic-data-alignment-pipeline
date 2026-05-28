@@ -32,12 +32,7 @@ class SyntheticDataGenerator:
         if api_key == 'os.environ.get("GEMINI_API_KEY")' or "Placeholder" in api_key:
             api_key = "AIzaSyDummyPlaceholderKey"
 
-        # Configure a generous 300-second network read timeout to fully prevent httpcore.ReadTimeout crashes
-        global client
-        if client is not None:
-            self.client = client
-        else:
-            self.client = genai.Client(api_key=api_key)
+        self.client = genai.Client(api_key=api_key)
         # Force the system channel to default to the stable production version of Gemini 2.5 Flash
         self.model_name = "gemini-2.5-flash"
 
