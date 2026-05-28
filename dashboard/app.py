@@ -34,6 +34,13 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+import sys
+from pathlib import Path
+
+# Force add the project root directory to the Python execution path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+# Your existing imports continue below safely...
 from config.settings import settings
 
 # ══════════════════════════════════════════════════════════════
