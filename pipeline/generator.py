@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any
 
 from openai import OpenAI, RateLimitError
+from google.api_core.exceptions import ResourceExhausted
 
 from config.settings import settings
 
@@ -158,7 +159,7 @@ class SyntheticDataGenerator:
             raise ValueError(f"num_samples must be ≥ 1, got {num_samples}.")
 
         # Enforce strict small batch fragmentation to stay completely clear of token limits
-        CHUNK_SIZE = 2
+        CHUNK_SIZE = 1
 
         # Build the list of chunk sizes: e.g. num_samples=7 → [2, 2, 2, 1]
         chunks: list[int] = []
@@ -284,7 +285,7 @@ class SyntheticDataGenerator:
                         }
                     ],
                     temperature=self._temperature,
-                    max_tokens=4096,  # Plenty of room for 2 large samples; perfectly safe for OpenRouter free balance allocation
+                    max_tokens=490,  # Limits token allocation to stay under OpenRouter free tier account balance reservation limit (402)
                     timeout=120,       # seconds — prevents hanging on slow cloud hops
                 )
                 raw_text: str = completion.choices[0].message.content or ""
