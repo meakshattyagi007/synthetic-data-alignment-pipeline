@@ -41,8 +41,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import openai
 from openai import OpenAI, RateLimitError
-from google.api_core.exceptions import ResourceExhausted
 
 from config.settings import settings
 
@@ -298,7 +298,7 @@ class SyntheticDataGenerator:
                 time.sleep(_PROACTIVE_THROTTLE)
                 return raw_text  # ← success
 
-            except RateLimitError as exc:
+            except openai.RateLimitError as exc:
                 attempt += 1
                 # Extract server-suggested delay (e.g. "Retry after 30s").
                 delay_match = re.search(r"(\d+)\s*s", str(exc))
