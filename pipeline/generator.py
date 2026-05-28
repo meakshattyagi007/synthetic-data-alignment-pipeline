@@ -189,7 +189,8 @@ class SyntheticDataGenerator:
                         }
                     ],
                     temperature=self._temperature,
-                    timeout=120,  # seconds — prevents hanging on slow cloud hops
+                    max_tokens=2048,   # Caps OpenRouter credit reservation — avoids 402
+                    timeout=120,       # seconds — prevents hanging on slow cloud hops
                 )
                 raw_text = completion.choices[0].message.content or ""
 
