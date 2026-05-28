@@ -25,6 +25,16 @@ Design rules (enforced)
 
 from __future__ import annotations
 
+import os
+import sys
+
+# Dynamically discover the absolute root path of the repository
+root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+# Force inject it to the front of python's scanning lookup array
+if root_path not in sys.path:
+    sys.path.insert(0, root_path)
+
 import json
 import traceback
 from pathlib import Path
@@ -34,13 +44,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-import sys
-from pathlib import Path
-
-# Force add the project root directory to the Python execution path
-sys.path.append(str(Path(__file__).resolve().parent.parent))
-
-# Your existing imports continue below safely...
 from config.settings import settings
 
 # ══════════════════════════════════════════════════════════════
