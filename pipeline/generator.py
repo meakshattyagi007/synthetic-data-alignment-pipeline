@@ -85,7 +85,32 @@ class SyntheticDataGenerator:
                     success = True
                     logger.info(f"Successfully compiled and parsed sample sequence {i + 1}.")
                     
-                except (APIError, Exception) as error:
+                except APIError as error:
+                    attempt += 1
+                    logger.warning(f"Pipeline intercept on sequence {i + 1}, attempt {attempt}/{MAX_LOCAL_ATTEMPTS}. Details: {str(error)}")
+                    
+                    if attempt >= MAX_LOCAL_ATTEMPTS:
+                        logger.error(f"Failed to compile sequence {i + 1} after maximum retries. Continuing batch.")
+                        break
+                        
+                    sleep_duration = 65.0
+                    try:
+                        if hasattr(error, 'details') and error.details:
+                            for detail in error.details:
+                                if 'retryDelay' in detail and detail['retryDelay']:
+                                    # Extract only raw numerical digits and decimal points defensively
+                                    raw_delay_str = str(detail['retryDelay'])
+                                    cleaned_chars = [char for char in raw_delay_str if char.isdigit() or char == '.']
+                                    if cleaned_chars:
+                                        sleep_duration = float("".join(cleaned_chars)) + 2.0
+                                        break
+                    except Exception as parse_err:
+                        logger.warning(f"Metadata extraction fallback triggered: {str(parse_err)}")
+                        sleep_duration = 65.0
+                        
+                    logger.info(f"Rate limit backoff initiated. Sleeping pipeline for {sleep_duration} seconds...")
+                    time.sleep(sleep_duration)
+                except Exception as error:
                     attempt += 1
                     logger.warning(f"Pipeline intercept on sequence {i + 1}, attempt {attempt}/{MAX_LOCAL_ATTEMPTS}. Details: {str(error)}")
                     
@@ -93,7 +118,6 @@ class SyntheticDataGenerator:
                         logger.error(f"Failed to compile sequence {i + 1} after maximum retries. Continuing batch to preserve application stability.")
                         break
                     
-                    # Catch the sliding window quota blocks gracefully. Sleep a full 35 seconds to let the direct free tier RPM reset
                     time.sleep(35.0)
             
             # Mandatory proactive delay pacing between successful chunk generations. 
