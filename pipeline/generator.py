@@ -157,10 +157,8 @@ class SyntheticDataGenerator:
         if num_samples < 1:
             raise ValueError(f"num_samples must be ≥ 1, got {num_samples}.")
 
-        # ── Mini-chunk sizing ────────────────────────────────────────────────
-        # 2 samples per call keeps each response comfortably inside 2 048 tokens
-        # and eliminates unterminated-string truncation on high-volume requests.
-        CHUNK_SIZE: int = 2
+        # Enforce strict small batch fragmentation to stay completely clear of token limits
+        CHUNK_SIZE = 2
 
         # Build the list of chunk sizes: e.g. num_samples=7 → [2, 2, 2, 1]
         chunks: list[int] = []
