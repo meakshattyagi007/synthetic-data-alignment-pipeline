@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 import google.generativeai as genai
+from google.api_core import retry
 
 from config.settings import settings
 
@@ -172,10 +173,24 @@ class SyntheticDataGenerator:
             f"on topic '{topic}' from {self._model_id} ..."
         )
 
+        # Retry policy: up to 3 attempts with exponential backoff, capped at 60s
+        # between retries. Retries on DeadlineExceeded and ServiceUnavailable,
+        # which occur on Streamlit Cloud during heavy structural JSON generation.
+        _retry_policy = retry.Retry(
+            predicate=retry.if_exception_type(
+                Exception,  # broad catch; generator re-raises on non-retryable failures
+            ),
+            initial=2.0,       # first backoff: 2 seconds
+            maximum=60.0,      # cap each wait at 60 seconds
+            multiplier=2.0,    # double the wait on each successive retry
+            deadline=360.0,    # give up entirely after 6 minutes total
+        )
+
         try:
             response = self._model.generate_content(
                 prompt,
                 generation_config=self._generation_config,
+                request_options={"timeout": 120},  # 120-second per-request timeout
             )
             raw_text: str = response.text
         except Exception:
