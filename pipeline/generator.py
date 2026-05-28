@@ -192,31 +192,29 @@ class SyntheticDataGenerator:
                 topic=topic,
                 num_samples=chunk_size,
             )
+            # Force model brevity to strictly save tokens and fit within window
+            chunk_prompt += (
+                "\nGenerate exactly ONE highly compact synthetic data record matching the required JSON schema. "
+                "The output text values must be extremely short, using crisp bullet points or single-sentence answers. "
+                "Keep descriptions under 40 words total to strictly save tokens."
+            )
 
             # Delegate the API call (with retry + throttle) to the helper.
             raw_text = self._call_api_with_retry(chunk_prompt)
 
-            # Strip potential markdown clutter
-            cleaned_json = raw_text.strip()
+            raw_json = raw_text
+
+            cleaned_json = raw_json.strip()
             if cleaned_json.startswith("```"):
                 cleaned_json = "\n".join(cleaned_json.split("\n")[1:])
                 if cleaned_json.endswith("```"):
                     cleaned_json = cleaned_json[:-3]
             cleaned_json = cleaned_json.strip()
 
-            # Defensive auto-repair for unterminated JSON objects/arrays
-            if cleaned_json.startswith("["):
-                if not cleaned_json.endswith("]"):
-                    if not cleaned_json.endswith("}"):
-                        if cleaned_json.count('"') % 2 != 0:
-                            cleaned_json += '"'
-                        cleaned_json += "}"
-                    cleaned_json += "]"
-            else:
-                if not cleaned_json.endswith("}"):
-                    if cleaned_json.count('"') % 2 != 0:
-                        cleaned_json += '"'
-                    cleaned_json += "}"
+            if not cleaned_json.endswith("}"):
+                if cleaned_json.count('"') % 2 != 0:
+                    cleaned_json += '"'
+                cleaned_json += "}"
 
             # Parse this chunk's JSON
             try:
@@ -297,13 +295,9 @@ class SyntheticDataGenerator:
             try:
                 completion = _client.chat.completions.create(
                     model="google/gemini-2.5-flash",
-                    messages=[
-                        {"role": "user", "content": prompt}
-                    ],
+                    messages=[{"role": "user", "content": prompt}],
                     response_format={"type": "json_object"},
-                    max_tokens=1000,  # Force huge completion headroom to prevent text clipping
-                    temperature=self._temperature,
-                    timeout=120,
+                    max_tokens=350,
                 )
                 raw_text: str = completion.choices[0].message.content or ""
 
