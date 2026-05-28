@@ -33,9 +33,10 @@ Design invariants
 
 from __future__ import annotations
 
-import json
-import re
 import time
+import json
+import os
+import re
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -195,32 +196,50 @@ class SyntheticDataGenerator:
             # Delegate the API call (with retry + throttle) to the helper.
             raw_text = self._call_api_with_retry(chunk_prompt)
 
-            # Strip markdown fences the model may wrap around the JSON array.
-            raw_json: str = self._extract_json(raw_text)
+            # Strip potential markdown clutter
+            cleaned_json = raw_text.strip()
+            if cleaned_json.startswith("```"):
+                cleaned_json = "\n".join(cleaned_json.split("\n")[1:])
+                if cleaned_json.endswith("```"):
+                    cleaned_json = cleaned_json[:-3]
+            cleaned_json = cleaned_json.strip()
 
-            # Parse this chunk's JSON array.
+            # Defensive auto-repair for unterminated JSON objects/arrays
+            if cleaned_json.startswith("["):
+                if not cleaned_json.endswith("]"):
+                    if not cleaned_json.endswith("}"):
+                        if cleaned_json.count('"') % 2 != 0:
+                            cleaned_json += '"'
+                        cleaned_json += "}"
+                    cleaned_json += "]"
+            else:
+                if not cleaned_json.endswith("}"):
+                    if cleaned_json.count('"') % 2 != 0:
+                        cleaned_json += '"'
+                    cleaned_json += "}"
+
+            # Parse this chunk's JSON
             try:
-                chunk_records: list[dict[str, Any]] = json.loads(raw_json)
-            except json.JSONDecodeError as exc:
+                chunk_records = json.loads(cleaned_json)
+                if isinstance(chunk_records, dict):
+                    chunk_records = [chunk_records]
+                if not isinstance(chunk_records, list):
+                    raise TypeError(
+                        f"Expected JSON array or object, got {type(chunk_records).__name__}"
+                    )
+
+                all_records.extend(chunk_records)
                 print(
-                    f"\n[generator] [WARN] Chunk {chunk_idx} response was not valid JSON.\n"
+                    f"[generator] Chunk {chunk_idx}/{total_chunks}: "
+                    f"collected {len(chunk_records)} record(s) "
+                    f"(running total: {len(all_records)}/{num_samples})."
+                )
+            except (json.JSONDecodeError, TypeError, Exception) as exc:
+                print(
+                    f"\n[generator] [WARN] Chunk {chunk_idx} parse or processing failed: {exc}. Skipping chunk.\n"
                     f"Raw text (first 500 chars): {raw_text[:500]}\n"
-                    f"JSONDecodeError: {exc}"
                 )
-                raise
-
-            if not isinstance(chunk_records, list):
-                raise TypeError(
-                    f"Chunk {chunk_idx}: expected JSON array from model, "
-                    f"got {type(chunk_records).__name__}."
-                )
-
-            all_records.extend(chunk_records)
-            print(
-                f"[generator] Chunk {chunk_idx}/{total_chunks}: "
-                f"collected {len(chunk_records)} record(s) "
-                f"(running total: {len(all_records)}/{num_samples})."
-            )
+                continue
 
         # ── Enrich every record with provenance metadata ──────────────────────
         generated_at = datetime.now(tz=timezone.utc).isoformat()
@@ -279,14 +298,12 @@ class SyntheticDataGenerator:
                 completion = _client.chat.completions.create(
                     model="google/gemini-2.5-flash",
                     messages=[
-                        {
-                            "role": "user",
-                            "content": prompt,
-                        }
+                        {"role": "user", "content": prompt}
                     ],
+                    response_format={"type": "json_object"},
+                    max_tokens=1000,  # Force huge completion headroom to prevent text clipping
                     temperature=self._temperature,
-                    max_tokens=490,  # Limits token allocation to stay under OpenRouter free tier account balance reservation limit (402)
-                    timeout=120,       # seconds — prevents hanging on slow cloud hops
+                    timeout=120,
                 )
                 raw_text: str = completion.choices[0].message.content or ""
 
