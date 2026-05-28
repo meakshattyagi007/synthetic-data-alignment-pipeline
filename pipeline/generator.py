@@ -59,8 +59,8 @@ _client: OpenAI = OpenAI(
 # ──────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────
-# OpenRouter model slug for Gemini 2.5 Flash (free-tier route).
-_MODEL_ID: str = "google/gemini-2.5-flash-preview"
+# OpenRouter model slug for Gemini 2.5 Flash.
+_MODEL_ID: str = "google/gemini-2.5-flash"
 
 _OUTPUT_ROOT: Path = Path(settings.OUTPUT_DIR)
 _GENERATED_DIR: Path = _OUTPUT_ROOT / "generated"
@@ -181,7 +181,7 @@ class SyntheticDataGenerator:
         while attempt < _MAX_RETRIES:
             try:
                 completion = _client.chat.completions.create(
-                    model=self._model_id,
+                    model="google/gemini-2.5-flash",
                     messages=[
                         {
                             "role": "user",
