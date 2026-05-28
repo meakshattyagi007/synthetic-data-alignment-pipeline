@@ -127,10 +127,11 @@ class SyntheticDataGenerator:
         """
         Generate a batch of synthetic instruction/input/output triplets.
 
-        Constructs a structured system prompt that constrains the model to
-        return a valid JSON array conforming to the triplet schema, then
-        calls the OpenRouter API (OpenAI-compatible), parses the response,
-        and persists the results to disk.
+        Splits ``num_samples`` into mini-chunks of ``CHUNK_SIZE`` samples each
+        and issues one API call per chunk. This keeps every response well within
+        the ``max_tokens`` window, eliminating ``JSONDecodeError`` truncation on
+        large requests.  The existing rate-limit retry policy and proactive
+        throttle are applied to every chunk call.
 
         Parameters
         ----------
@@ -138,7 +139,7 @@ class SyntheticDataGenerator:
             Subject domain for the synthetic samples
             (e.g. ``"Python asyncio programming"``).
         num_samples : int
-            Exact number of samples to generate.  Must be ≥ 1.
+            Total number of samples to generate.  Must be ≥ 1.
 
         Returns
         -------
@@ -156,27 +157,123 @@ class SyntheticDataGenerator:
         if num_samples < 1:
             raise ValueError(f"num_samples must be ≥ 1, got {num_samples}.")
 
-        prompt = _SYSTEM_PROMPT_TEMPLATE.format(
-            topic=topic,
-            num_samples=num_samples,
-        )
+        # ── Mini-chunk sizing ────────────────────────────────────────────────
+        # 2 samples per call keeps each response comfortably inside 2 048 tokens
+        # and eliminates unterminated-string truncation on high-volume requests.
+        CHUNK_SIZE: int = 2
 
+        # Build the list of chunk sizes: e.g. num_samples=7 → [2, 2, 2, 1]
+        chunks: list[int] = []
+        remaining = num_samples
+        while remaining > 0:
+            chunk = min(CHUNK_SIZE, remaining)
+            chunks.append(chunk)
+            remaining -= chunk
+
+        total_chunks = len(chunks)
         print(
-            f"[generator] Requesting {num_samples} samples "
-            f"on topic '{topic}' via OpenRouter -> {self._model_id} ..."
+            f"[generator] Requesting {num_samples} samples on topic '{topic}' "
+            f"via OpenRouter -> {self._model_id} "
+            f"({total_chunks} chunk(s) of <={CHUNK_SIZE} each) ..."
         )
 
-        # ── Rate-limit-aware generation with exponential back-off ────────────
-        # HTTP 429 (RateLimitError) is caught natively.  The server-suggested
-        # retry delay is parsed from the error message; if absent we default
-        # to 60 s.  A proactive 3.5-second inter-call throttle is applied
-        # after every successful response to stay under any tier ceiling.
-        _MAX_RETRIES:            int   = 3
-        _DEFAULT_RATE_LIMIT_SLEEP: float = 60.0  # seconds to wait on 429
-        _PROACTIVE_THROTTLE:     float = 3.5   # seconds between successful calls
+        # ── Accumulate results across chunks ─────────────────────────────────
+        all_records: list[dict[str, Any]] = []
 
-        raw_text: str = ""
-        attempt:  int = 0
+        for chunk_idx, chunk_size in enumerate(chunks, start=1):
+            print(
+                f"[generator] Chunk {chunk_idx}/{total_chunks}: "
+                f"requesting {chunk_size} sample(s) ..."
+            )
+
+            # Build a fresh prompt for this exact chunk size so the model
+            # knows precisely how many objects to emit.
+            chunk_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
+                topic=topic,
+                num_samples=chunk_size,
+            )
+
+            # Delegate the API call (with retry + throttle) to the helper.
+            raw_text = self._call_api_with_retry(chunk_prompt)
+
+            # Strip markdown fences the model may wrap around the JSON array.
+            raw_json: str = self._extract_json(raw_text)
+
+            # Parse this chunk's JSON array.
+            try:
+                chunk_records: list[dict[str, Any]] = json.loads(raw_json)
+            except json.JSONDecodeError as exc:
+                print(
+                    f"\n[generator] [WARN] Chunk {chunk_idx} response was not valid JSON.\n"
+                    f"Raw text (first 500 chars): {raw_text[:500]}\n"
+                    f"JSONDecodeError: {exc}"
+                )
+                raise
+
+            if not isinstance(chunk_records, list):
+                raise TypeError(
+                    f"Chunk {chunk_idx}: expected JSON array from model, "
+                    f"got {type(chunk_records).__name__}."
+                )
+
+            all_records.extend(chunk_records)
+            print(
+                f"[generator] Chunk {chunk_idx}/{total_chunks}: "
+                f"collected {len(chunk_records)} record(s) "
+                f"(running total: {len(all_records)}/{num_samples})."
+            )
+
+        # ── Enrich every record with provenance metadata ──────────────────────
+        generated_at = datetime.now(tz=timezone.utc).isoformat()
+        for idx, rec in enumerate(all_records):
+            rec.setdefault("_meta", {})
+            rec["_meta"].update(
+                {
+                    "topic":        topic,
+                    "sample_index": idx,
+                    "model":        self._model_id,
+                    "router":       "openrouter.ai",
+                    "generated_at": generated_at,
+                }
+            )
+
+        saved_path = self._save_to_disk(all_records)
+        print(f"[generator] [OK] Saved {len(all_records)} records -> {saved_path}")
+        return all_records
+
+    # ── Private helpers ───────────────────────────────────────
+
+    def _call_api_with_retry(self, prompt: str) -> str:
+        """
+        Issue a single chat-completion request to OpenRouter with retry logic.
+
+        Handles ``RateLimitError`` (HTTP 429) with exponential back-off (up to
+        3 attempts) and applies a proactive 3.5-second throttle after every
+        successful response to keep the sustained request rate under any tier
+        ceiling.
+
+        Parameters
+        ----------
+        prompt : str
+            The fully-formatted user prompt to send.
+
+        Returns
+        -------
+        str
+            The raw text content returned by the model.
+
+        Raises
+        ------
+        RateLimitError
+            After ``_MAX_RETRIES`` consecutive 429 responses.
+        Exception
+            Any other API error, re-raised after printing a scrubbed traceback.
+        """
+        _MAX_RETRIES:             int   = 3
+        _DEFAULT_RATE_LIMIT_SLEEP: float = 60.0  # seconds to wait on 429
+        _PROACTIVE_THROTTLE:      float = 3.5   # seconds between successful calls
+
+        attempt: int = 0
 
         while attempt < _MAX_RETRIES:
             try:
@@ -192,7 +289,7 @@ class SyntheticDataGenerator:
                     max_tokens=2048,   # Caps OpenRouter credit reservation — avoids 402
                     timeout=120,       # seconds — prevents hanging on slow cloud hops
                 )
-                raw_text = completion.choices[0].message.content or ""
+                raw_text: str = completion.choices[0].message.content or ""
 
                 # Proactive throttle — keeps sustained RPM under the tier cap.
                 print(
@@ -200,14 +297,16 @@ class SyntheticDataGenerator:
                     f"to stay under rate-limit ceiling ..."
                 )
                 time.sleep(_PROACTIVE_THROTTLE)
-                break  # success — exit the retry loop
+                return raw_text  # ← success
 
             except RateLimitError as exc:
                 attempt += 1
                 # Extract server-suggested delay (e.g. "Retry after 30s").
                 delay_match = re.search(r"(\d+)\s*s", str(exc))
-                sleep_for = float(delay_match.group(1)) if delay_match else _DEFAULT_RATE_LIMIT_SLEEP
-
+                sleep_for = (
+                    float(delay_match.group(1)) if delay_match
+                    else _DEFAULT_RATE_LIMIT_SLEEP
+                )
                 print(
                     f"\n[generator] [WARN] Rate limit hit (429 RateLimitError). "
                     f"Attempt {attempt}/{_MAX_RETRIES}. "
@@ -222,52 +321,15 @@ class SyntheticDataGenerator:
             except Exception:
                 print("\n[generator] [ERROR] OpenRouter API call failed:")
                 tb_str = traceback.format_exc()
-                # Scrub any accidental key leakage from tracebacks.
                 scrubbed_tb = re.sub(
                     r"sk-or-[A-Za-z0-9\-_]{10,80}", "[REDACTED_API_KEY]", tb_str
                 )
                 print(scrubbed_tb)
                 raise
 
-        # Strip markdown fences the model may wrap around the JSON array
-        # even when the prompt explicitly asks for raw JSON.
-        raw_json: str = self._extract_json(raw_text)
+        # Unreachable — the loop always returns or raises.
+        raise RuntimeError("_call_api_with_retry exited without returning.")  # pragma: no cover
 
-        # Parse the JSON array returned by the model.
-        try:
-            records: list[dict[str, Any]] = json.loads(raw_json)
-        except json.JSONDecodeError as exc:
-            print(
-                f"\n[generator] [WARN] Response was not valid JSON.\n"
-                f"Raw text (first 500 chars): {raw_text[:500]}\n"
-                f"JSONDecodeError: {exc}"
-            )
-            raise
-
-        if not isinstance(records, list):
-            raise TypeError(
-                f"Expected JSON array from model, got {type(records).__name__}."
-            )
-
-        # Enrich each record with provenance metadata.
-        generated_at = datetime.now(tz=timezone.utc).isoformat()
-        for idx, rec in enumerate(records):
-            rec.setdefault("_meta", {})
-            rec["_meta"].update(
-                {
-                    "topic":        topic,
-                    "sample_index": idx,
-                    "model":        self._model_id,
-                    "router":       "openrouter.ai",
-                    "generated_at": generated_at,
-                }
-            )
-
-        saved_path = self._save_to_disk(records)
-        print(f"[generator] [OK] Saved {len(records)} records -> {saved_path}")
-        return records
-
-    # ── Private helpers ───────────────────────────────────────
 
     @staticmethod
     def _extract_json(text: str) -> str:
