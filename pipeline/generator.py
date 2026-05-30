@@ -1,6 +1,7 @@
 import time
 import json
 import os
+import re
 import logging
 from typing import List, Dict, Any
 import openai
@@ -20,10 +21,10 @@ class SyntheticDataGenerator:
     """Sequential synthetic-data generator routed through the OpenRouter API
     gateway using the standard OpenAI client interface.
 
-    Configure OPENROUTER_API_KEY as a single credential string inside your
-    environment / Streamlit Secrets.  OpenRouter provides an independent
-    network infrastructure that bypasses Google AI Studio project-level
-    daily token quota blocks.
+    Includes a bulletproof text-extraction layer that strips markdown fences,
+    handles NoneType payloads, and performs brace-boundary fallback trimming
+    before JSON parsing — accommodating open-weights models that return
+    conversational prefixes or code-block wrappers around their output.
     """
 
     # ------------------------------------------------------------------
@@ -34,21 +35,52 @@ class SyntheticDataGenerator:
         api_key = os.environ.get("OPENROUTER_API_KEY")
         if not api_key:
             raise ValueError(
-                "Deployment Exception: OPENROUTER_API_KEY variable is missing "
-                "from the environment workspace configuration."
+                "Configuration Error: OPENROUTER_API_KEY is absent from "
+                "environment variables."
             )
 
-        # Point the client execution layer directly at OpenRouter
         self.client = openai.OpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=api_key,
         )
-        # Target the stable, fast Gemini 2.5 Flash channel hosted via OpenRouter
         self.model_name = "openai/gpt-oss-20b:free"
 
         logger.info(
             f"OpenRouter client initialized. Active model channel: {self.model_name}"
         )
+
+    # ------------------------------------------------------------------
+    # Internal: resilient JSON extraction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_json(raw_text: str) -> str:
+        """Strip markdown fences and stray text from *raw_text*, returning
+        the innermost JSON object string ready for ``json.loads``.
+
+        Strategy (applied in order):
+        1. If backtick fences are present, extract the block content via regex.
+        2. Strip any residual fence markers if the regex finds no capture group.
+        3. Trim leading/trailing characters outside the outermost ``{…}`` pair.
+        """
+        cleaned = raw_text.strip()
+
+        # Step 1 & 2 — backtick fence removal
+        if "```" in cleaned:
+            match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned)
+            if match:
+                cleaned = match.group(1).strip()
+            else:
+                # Fallback: strip all fence markers and clean up
+                cleaned = re.sub(r"```[a-zA-Z]*", "", cleaned).strip()
+
+        # Step 3 — brace-boundary trim: handle conversational text bleed
+        if not cleaned.startswith("{") and "{" in cleaned:
+            cleaned = cleaned[cleaned.find("{"):]
+        if not cleaned.endswith("}") and "}" in cleaned:
+            cleaned = cleaned[: cleaned.rfind("}") + 1]
+
+        return cleaned
 
     # ------------------------------------------------------------------
     # Batch generation control-flow pipeline
@@ -57,16 +89,15 @@ class SyntheticDataGenerator:
     def generate_batch(self, topic: str, num_samples: int) -> List[Dict[str, Any]]:
         """Generate *num_samples* synthetic JSON records for *topic*.
 
-        Items are processed sequentially (one per API call) to keep the
-        token footprint small and stay within free-tier account limits.
-        max_tokens=400 is enforced on every call to guarantee compact,
-        cost-free responses and pass OpenRouter balance pre-checks.
+        Items are processed sequentially (one per API call).  Every response
+        passes through ``_extract_json`` before ``json.loads`` to handle
+        open-weights model quirks (markdown fences, conversational prefixes).
         """
         master_dataset: List[Dict[str, Any]] = []
         MAX_LOCAL_ATTEMPTS = 3
 
         logger.info(
-            f"Launching sequential OpenRouter dataset generation for topic: "
+            f"Starting sequential dataset construction for topic: "
             f"'{topic}' targeting {num_samples} records."
         )
 
@@ -77,9 +108,9 @@ class SyntheticDataGenerator:
                 f"You are a synthetic data generator. Topic context: {topic}. "
                 "Task: Generate exactly ONE highly compact, professional synthetic "
                 "record matching your standard input-output data alignment triple "
-                "schema. Provide short, direct bullet points or single-sentence "
-                "values. Keep descriptions under 40 words total. "
-                "Return only raw JSON data fitting the structure without formatting errors."
+                "schema. Return ONLY a raw JSON object string. Do not include "
+                "markdown code blocks, backticks, or text descriptions. "
+                "Output must start with '{' and end with '}'."
             )
 
             attempt = 0
@@ -90,51 +121,78 @@ class SyntheticDataGenerator:
                     completion = self.client.chat.completions.create(
                         model=self.model_name,
                         messages=[{"role": "user", "content": prompt_content}],
-                        response_format={"type": "json_object"},
+                        temperature=0.3,
                         max_tokens=400,
                     )
 
-                    raw_text = completion.choices[0].message.content
-                    if not raw_text:
+                    # Guard 1 — NoneType / empty payload
+                    if (
+                        not completion
+                        or not completion.choices
+                        or completion.choices[0].message.content is None
+                    ):
                         raise ValueError(
-                            "Received an empty content payload from the API gateway."
+                            "API gateway returned an unreadable or completely "
+                            "empty response object."
                         )
 
-                    cleaned_json = raw_text.strip()
+                    raw_text = completion.choices[0].message.content.strip()
+
+                    # Guard 2 — blank content string
+                    if not raw_text:
+                        raise ValueError(
+                            "Response content string is empty after stripping."
+                        )
+
+                    # Extract and clean JSON from any wrapper text / fences
+                    cleaned_json = self._extract_json(raw_text)
+
+                    # Guard 3 — nothing parseable survived extraction
+                    if not cleaned_json:
+                        raise ValueError(
+                            f"JSON extraction yielded an empty string. "
+                            f"Raw payload: {raw_text[:120]!r}"
+                        )
+
                     parsed_record = json.loads(cleaned_json)
 
                     if isinstance(parsed_record, list):
                         if len(parsed_record) > 0:
                             master_dataset.append(parsed_record[0])
                         else:
-                            raise ValueError("Returned JSON data list array was empty.")
+                            raise ValueError("Decoded list array instance was empty.")
                     else:
                         master_dataset.append(parsed_record)
 
                     success = True
-                    logger.info(f"Successfully compiled sample sequence {i + 1}.")
+                    logger.info(
+                        f"Successfully compiled sample sequence {i + 1}."
+                    )
 
                 except Exception as error:
                     attempt += 1
                     logger.warning(
-                        f"OpenRouter proxy warning on sequence {i + 1}, "
+                        f"Data normalization alert on sequence {i + 1}, "
                         f"attempt {attempt}/{MAX_LOCAL_ATTEMPTS}. "
                         f"Details: {str(error)}"
                     )
 
                     if attempt >= MAX_LOCAL_ATTEMPTS:
                         logger.error(
-                            f"Failed to compile sequence {i + 1} after maximum "
-                            "retries. Continuing batch to preserve app stability."
+                            f"Failed parsing validation for row {i + 1}. "
+                            "Continuing batch execution."
                         )
                         break
 
-                    # Short cooldown pause before retrying with the client proxy
-                    time.sleep(4.0)
+                    time.sleep(3.0)
 
-            # Maintain a clean 1-second processing step delay between successful items
             if success and i < num_samples - 1:
                 time.sleep(1.0)
+
+        logger.info(
+            f"Batch sequence execution finalized. "
+            f"Captured {len(master_dataset)} verified records."
+        )
 
         # ── Enrich every record with provenance metadata ──────────────────
         from datetime import datetime, timezone
@@ -170,7 +228,7 @@ class SyntheticDataGenerator:
         logger.info(f"Saved {len(master_dataset)} records → {output_path.resolve()}")
 
         logger.info(
-            f"Batch generation completed. Successfully compiled "
+            f"Batch processing run finalized. Successfully compiled "
             f"{len(master_dataset)} total records out of {num_samples} requested."
         )
         return master_dataset
