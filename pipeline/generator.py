@@ -140,24 +140,34 @@ class SyntheticDataGenerator:
                     attempt += 1
                     logger.warning(
                         f"Key index {self.current_key_index} locked. "
-                        f"Intercept on attempt {attempt}/{MAX_CLUSTER_ATTEMPTS}. "
-                        "Rotating engine context..."
+                        f"Intercept on attempt {attempt}/{MAX_CLUSTER_ATTEMPTS}."
                     )
 
-                    # Move to the next fresh key instantly
+                    # Move context pointer to the next available token channel
                     self._rotate_key()
 
                     if attempt >= MAX_CLUSTER_ATTEMPTS:
-                        logger.error(
-                            f"\U0001f6a8 Entire key cluster pool exhausted for "
-                            f"sequence {i + 1}. Skipping sample to preserve "
-                            "session state."
+                        # Before skipping completely, initiate a last-resort
+                        # 65-second macro system freeze to clear the shared
+                        # pool quota umbrella on the Google gateway backend
+                        logger.warning(
+                            "\U0001f6a8 Entire cluster pool exhausted! "
+                            "Enforcing a 65-second macro system reset cooldown..."
                         )
-                        break
+                        time.sleep(65.0)
+                        # Reset the local attempt counter to give the cluster
+                        # a clean second pass at the exact same sequence item
+                        attempt = 0
+                        continue
 
-                    # Tiny pause to let the socket clear before hitting the
-                    # new key channel — rotation already handles quota pressure
-                    time.sleep(0.2)
+                    # Progressive pacing sleep: scales with consecutive failures
+                    # so the shared rate-limit sliding window gets room to breathe.
+                    # Routine early rotation → 2.5s | sustained pressure → 5.0s
+                    sleep_buffer = 2.5 if attempt < 3 else 5.0
+                    logger.info(
+                        f"Pacing key switch. Sleeping channel for {sleep_buffer}s..."
+                    )
+                    time.sleep(sleep_buffer)
 
                 except Exception as gen_err:
                     attempt += 1
