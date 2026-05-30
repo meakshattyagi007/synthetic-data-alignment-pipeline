@@ -6,13 +6,14 @@ Single-source-of-truth environment configurator for the pipeline.
 Boot behaviour
 --------------
 - Loads .env from the project root (absolute path resolved at import time).
-- Validates all required fields immediately via Pydantic Settings.
-- If OPENROUTER_API_KEY is absent or empty the process crashes with a
-  human-readable stdout message — no silent failures.
+- Validates all present fields immediately via Pydantic Settings.
+- Both API key fields are optional so the process never crashes on boot
+  due to a missing key — runtime components are responsible for asserting
+  the specific key they require.
 
 Usage (anywhere in the project):
     from config.settings import settings
-    key = settings.OPENROUTER_API_KEY.get_secret_value()
+    key = settings.OPENROUTER_API_KEY  # str | None
 """
 
 from __future__ import annotations
@@ -22,7 +23,8 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from pydantic import SecretStr, field_validator
+from typing import Optional
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # ──────────────────────────────────────────────────────────────
@@ -55,25 +57,16 @@ class PipelineSettings(BaseSettings):
         extra="ignore",
     )
 
-    # ── Required ─────────────────────────────────────────────
-    # Native Google Gemini API key
-    GEMINI_API_KEY: SecretStr
+    # ── API keys — both optional for forward/backward compatibility ──────
+    # Primary: OpenRouter gateway credential (routes via openrouter.ai)
+    OPENROUTER_API_KEY: Optional[str] = None
+    # Legacy: Google AI Studio direct key (retained for compatibility)
+    GEMINI_API_KEY: Optional[str] = None
 
-    # ── Optional (with sensible defaults) ───────────────────
+    # ── General settings ─────────────────────────────────────────────────
     OUTPUT_DIR: str = "output"
 
-    # ── Validators ───────────────────────────────────────────
-    @field_validator("GEMINI_API_KEY", mode="before")
-    @classmethod
-    def _api_key_must_not_be_empty(cls, v: object) -> object:
-        """Reject an explicitly empty string so callers get a clear error."""
-        if isinstance(v, str) and v.strip() == "":
-            raise ValueError(
-                "GEMINI_API_KEY is set but contains only whitespace. "
-                "Provide a valid Google Gemini API key."
-            )
-        return v
-
+    # ── Validators ───────────────────────────────────────────────────────
     @field_validator("OUTPUT_DIR", mode="after")
     @classmethod
     def _ensure_output_dir_exists(cls, v: str) -> str:
@@ -118,8 +111,8 @@ except Exception as exc:  # pydantic.ValidationError or similar
 
     print(
         "  Fix: Ensure a .env file exists at the project root containing:\n"
-        "       GEMINI_API_KEY=<your-gemini-key>\n"
-        "  Obtain a key at: https://aistudio.google.com/app/apikey\n",
+        "       OPENROUTER_API_KEY=<your-openrouter-key>\n"
+        "  Obtain a key at: https://openrouter.ai/keys\n",
         file=sys.stderr,
     )
     print(_SEPARATOR, file=sys.stderr)
@@ -134,6 +127,8 @@ if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
     print("[OK] Environment validation passed.")
-    print(f"     OUTPUT_DIR                   : {settings.OUTPUT_DIR}")
-    key_val = settings.GEMINI_API_KEY.get_secret_value()
-    print(f"     GEMINI_API_KEY (masked)      : {'*' * 8}{key_val[-4:]}")
+    print(f"     OUTPUT_DIR         : {settings.OUTPUT_DIR}")
+    or_key = settings.OPENROUTER_API_KEY or ""
+    gem_key = settings.GEMINI_API_KEY or ""
+    print(f"     OPENROUTER_API_KEY : {'*' * 8 + or_key[-4:] if or_key else '[not set]'}")
+    print(f"     GEMINI_API_KEY     : {'*' * 8 + gem_key[-4:] if gem_key else '[not set]'}")
