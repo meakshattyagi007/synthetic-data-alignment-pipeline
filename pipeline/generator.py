@@ -44,7 +44,7 @@ class SyntheticDataGenerator:
             api_key=api_key,
         )
         # Target the stable, fast Gemini 2.5 Flash channel hosted via OpenRouter
-        self.model_name = "google/gemini-2.5-flash"
+        self.model_name = "meta-llama/llama-3.3-70b-instruct:free"
 
         logger.info(
             f"OpenRouter client initialized. Active model channel: {self.model_name}"
