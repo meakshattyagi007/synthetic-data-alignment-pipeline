@@ -3,9 +3,7 @@ import json
 import os
 import logging
 from typing import List, Dict, Any
-from google import genai
-from google.genai import types
-from google.genai.errors import APIError
+import openai
 
 logger = logging.getLogger(__name__)
 
@@ -19,13 +17,13 @@ _SYSTEM_PROMPT_TEMPLATE = (
 
 
 class SyntheticDataGenerator:
-    """High-throughput synthetic-data generator backed by a multi-key
-    rotation pool that scales free-tier API boundaries by up to 12×.
+    """Sequential synthetic-data generator routed through the OpenRouter API
+    gateway using the standard OpenAI client interface.
 
-    Configure GEMINI_API_KEY as a comma-separated list of Gemini API keys
-    inside your environment / Streamlit Secrets.  The pool engine cycles
-    through each key after every sample so that no single key ever sustains
-    a 429 back-pressure window alone.
+    Configure OPENROUTER_API_KEY as a single credential string inside your
+    environment / Streamlit Secrets.  OpenRouter provides an independent
+    network infrastructure that bypasses Google AI Studio project-level
+    daily token quota blocks.
     """
 
     # ------------------------------------------------------------------
@@ -33,38 +31,24 @@ class SyntheticDataGenerator:
     # ------------------------------------------------------------------
 
     def __init__(self):
-        raw_keys = os.environ.get("GEMINI_API_KEY", "")
-        self.api_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
-
-        if not self.api_keys:
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
             raise ValueError(
-                "No API keys found. Please configure GEMINI_API_KEY as a "
-                "comma-separated string in Secrets."
+                "Deployment Exception: OPENROUTER_API_KEY variable is missing "
+                "from the environment workspace configuration."
             )
 
-        self.current_key_index = 0
-        self.model_name = "gemini-2.5-flash"
+        # Point the client execution layer directly at OpenRouter
+        self.client = openai.OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key,
+        )
+        # Target the stable, fast Gemini 2.5 Flash channel hosted via OpenRouter
+        self.model_name = "google/gemini-2.5-flash"
 
         logger.info(
-            f"Key rotation cluster initialized successfully with "
-            f"{len(self.api_keys)} active free-tier keys."
+            f"OpenRouter client initialized. Active model channel: {self.model_name}"
         )
-        self.client = genai.Client(api_key=self.api_keys[self.current_key_index])
-
-    # ------------------------------------------------------------------
-    # Pool engine rotation helper
-    # ------------------------------------------------------------------
-
-    def _rotate_key(self):
-        """Advance the active client to the next key slot in the pool ring."""
-        if len(self.api_keys) <= 1:
-            return
-        self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
-        logger.info(
-            f"🔄 Swapping execution context to API Key Channel Index: "
-            f"{self.current_key_index}"
-        )
-        self.client = genai.Client(api_key=self.api_keys[self.current_key_index])
 
     # ------------------------------------------------------------------
     # Batch generation control-flow pipeline
@@ -73,117 +57,84 @@ class SyntheticDataGenerator:
     def generate_batch(self, topic: str, num_samples: int) -> List[Dict[str, Any]]:
         """Generate *num_samples* synthetic JSON records for *topic*.
 
-        Each sample is requested individually so the pool rotator can shift
-        key context on every iteration, distributing load evenly across the
-        entire cluster.  A sample is only skipped when *every* key in the
-        pool has returned a rate-limit error back-to-back for that sample.
+        Items are processed sequentially (one per API call) to keep the
+        token footprint small and stay within free-tier account limits.
+        max_tokens=400 is enforced on every call to guarantee compact,
+        cost-free responses and pass OpenRouter balance pre-checks.
         """
         master_dataset: List[Dict[str, Any]] = []
-        # Ceiling = full pool size: every key must fail before we skip a sample
-        MAX_CLUSTER_ATTEMPTS = len(self.api_keys)
+        MAX_LOCAL_ATTEMPTS = 3
 
         logger.info(
-            f"Starting resilient batch generation pipeline for topic: "
-            f"'{topic}' targeting {num_samples} records "
-            f"(cluster ceiling: {MAX_CLUSTER_ATTEMPTS} keys)."
+            f"Launching sequential OpenRouter dataset generation for topic: "
+            f"'{topic}' targeting {num_samples} records."
         )
 
         for i in range(num_samples):
-            logger.info(f"Processing sample sequence {i + 1}/{num_samples}...")
+            logger.info(f"Compiling sample sequence {i + 1}/{num_samples}...")
 
             prompt_content = (
                 f"You are a synthetic data generator. Topic context: {topic}. "
                 "Task: Generate exactly ONE highly compact, professional synthetic "
                 "record matching your standard input-output data alignment triple "
                 "schema. Provide short, direct bullet points or single-sentence "
-                "values. Keep descriptions under 40 words total to minimize network "
-                "text size. Return only raw JSON data fitting the structure without "
-                "formatting errors."
+                "values. Keep descriptions under 40 words total. "
+                "Return only raw JSON data fitting the structure without formatting errors."
             )
 
             attempt = 0
             success = False
 
-            while attempt < MAX_CLUSTER_ATTEMPTS and not success:
+            while attempt < MAX_LOCAL_ATTEMPTS and not success:
                 try:
-                    response = self.client.models.generate_content(
+                    completion = self.client.chat.completions.create(
                         model=self.model_name,
-                        contents=prompt_content,
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            temperature=0.7,
-                        ),
+                        messages=[{"role": "user", "content": prompt_content}],
+                        response_format={"type": "json_object"},
+                        max_tokens=400,
                     )
 
-                    raw_text = response.text
+                    raw_text = completion.choices[0].message.content
                     if not raw_text:
-                        raise ValueError("Empty text payload received.")
+                        raise ValueError(
+                            "Received an empty content payload from the API gateway."
+                        )
 
                     cleaned_json = raw_text.strip()
                     parsed_record = json.loads(cleaned_json)
 
-                    # Unwrap a single-element list returned by the model
                     if isinstance(parsed_record, list):
                         if len(parsed_record) > 0:
                             master_dataset.append(parsed_record[0])
                         else:
-                            raise ValueError("JSON array returned empty.")
+                            raise ValueError("Returned JSON data list array was empty.")
                     else:
                         master_dataset.append(parsed_record)
 
                     success = True
-                    logger.info(
-                        f"Successfully compiled sample sequence {i + 1}."
-                    )
+                    logger.info(f"Successfully compiled sample sequence {i + 1}.")
 
-                except APIError as error:
+                except Exception as error:
                     attempt += 1
                     logger.warning(
-                        f"Key index {self.current_key_index} locked. "
-                        f"Intercept on attempt {attempt}/{MAX_CLUSTER_ATTEMPTS}."
+                        f"OpenRouter proxy warning on sequence {i + 1}, "
+                        f"attempt {attempt}/{MAX_LOCAL_ATTEMPTS}. "
+                        f"Details: {str(error)}"
                     )
 
-                    # Move context pointer to the next available token channel
-                    self._rotate_key()
-
-                    if attempt >= MAX_CLUSTER_ATTEMPTS:
-                        # Before skipping completely, initiate a last-resort
-                        # 65-second macro system freeze to clear the shared
-                        # pool quota umbrella on the Google gateway backend
-                        logger.warning(
-                            "\U0001f6a8 Entire cluster pool exhausted! "
-                            "Enforcing a 65-second macro system reset cooldown..."
+                    if attempt >= MAX_LOCAL_ATTEMPTS:
+                        logger.error(
+                            f"Failed to compile sequence {i + 1} after maximum "
+                            "retries. Continuing batch to preserve app stability."
                         )
-                        time.sleep(65.0)
-                        # Reset the local attempt counter to give the cluster
-                        # a clean second pass at the exact same sequence item
-                        attempt = 0
-                        continue
+                        break
 
-                    # Progressive pacing sleep: scales with consecutive failures
-                    # so the shared rate-limit sliding window gets room to breathe.
-                    # Routine early rotation → 2.5s | sustained pressure → 5.0s
-                    sleep_buffer = 2.5 if attempt < 3 else 5.0
-                    logger.info(
-                        f"Pacing key switch. Sleeping channel for {sleep_buffer}s..."
-                    )
-                    time.sleep(sleep_buffer)
+                    # Short cooldown pause before retrying with the client proxy
+                    time.sleep(4.0)
 
-                except Exception as gen_err:
-                    attempt += 1
-                    logger.error(
-                        f"Parsing/Unexpected variance: {str(gen_err)}. "
-                        "Swapping key..."
-                    )
-                    self._rotate_key()
-                    time.sleep(0.5)
-
-            # Post-item success rotation: balance request loading for the next
-            # element only when the current one succeeded
-            if success:
-                self._rotate_key()
-                if i < num_samples - 1:
-                    time.sleep(0.5)
+            # Maintain a clean 1-second processing step delay between successful items
+            if success and i < num_samples - 1:
+                time.sleep(1.0)
 
         # ── Enrich every record with provenance metadata ──────────────────
         from datetime import datetime, timezone
@@ -198,7 +149,7 @@ class SyntheticDataGenerator:
                     "topic":        topic,
                     "sample_index": idx,
                     "model":        self.model_name,
-                    "router":       "google-genai-native",
+                    "router":       "openrouter",
                     "generated_at": generated_at,
                 }
             )
@@ -219,7 +170,7 @@ class SyntheticDataGenerator:
         logger.info(f"Saved {len(master_dataset)} records → {output_path.resolve()}")
 
         logger.info(
-            f"Batch processing run finalized. Successfully compiled "
+            f"Batch generation completed. Successfully compiled "
             f"{len(master_dataset)} total records out of {num_samples} requested."
         )
         return master_dataset
