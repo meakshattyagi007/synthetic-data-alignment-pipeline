@@ -73,17 +73,19 @@ class SyntheticDataGenerator:
     def generate_batch(self, topic: str, num_samples: int) -> List[Dict[str, Any]]:
         """Generate *num_samples* synthetic JSON records for *topic*.
 
-        Each sample is requested individually (CHUNK_SIZE = 1) so the pool
-        rotator can shift key context on every iteration, distributing load
-        evenly across the entire cluster.
+        Each sample is requested individually so the pool rotator can shift
+        key context on every iteration, distributing load evenly across the
+        entire cluster.  A sample is only skipped when *every* key in the
+        pool has returned a rate-limit error back-to-back for that sample.
         """
         master_dataset: List[Dict[str, Any]] = []
-        CHUNK_SIZE = 1  # noqa: F841  — intentionally hardcoded per spec
-        MAX_LOCAL_ATTEMPTS = 3
+        # Ceiling = full pool size: every key must fail before we skip a sample
+        MAX_CLUSTER_ATTEMPTS = len(self.api_keys)
 
         logger.info(
             f"Starting resilient batch generation pipeline for topic: "
-            f"'{topic}' targeting {num_samples} records."
+            f"'{topic}' targeting {num_samples} records "
+            f"(cluster ceiling: {MAX_CLUSTER_ATTEMPTS} keys)."
         )
 
         for i in range(num_samples):
@@ -102,7 +104,7 @@ class SyntheticDataGenerator:
             attempt = 0
             success = False
 
-            while attempt < MAX_LOCAL_ATTEMPTS and not success:
+            while attempt < MAX_CLUSTER_ATTEMPTS and not success:
                 try:
                     response = self.client.models.generate_content(
                         model=self.model_name,
@@ -121,9 +123,11 @@ class SyntheticDataGenerator:
                     parsed_record = json.loads(cleaned_json)
 
                     # Unwrap a single-element list returned by the model
-                    if isinstance(parsed_record, list) and len(parsed_record) > 0:
-                        parsed_record = parsed_record[0]
-                        master_dataset.append(parsed_record)
+                    if isinstance(parsed_record, list):
+                        if len(parsed_record) > 0:
+                            master_dataset.append(parsed_record[0])
+                        else:
+                            raise ValueError("JSON array returned empty.")
                     else:
                         master_dataset.append(parsed_record)
 
@@ -136,63 +140,40 @@ class SyntheticDataGenerator:
                     attempt += 1
                     logger.warning(
                         f"Key index {self.current_key_index} locked. "
-                        f"Intercept on attempt {attempt}/{MAX_LOCAL_ATTEMPTS}. "
-                        f"Details: {str(error)}"
+                        f"Intercept on attempt {attempt}/{MAX_CLUSTER_ATTEMPTS}. "
+                        "Rotating engine context..."
                     )
 
-                    # Force rotate immediately inside exception space so the
-                    # next retry attempt uses a fresh key token stream.
+                    # Move to the next fresh key instantly
                     self._rotate_key()
 
-                    if attempt >= MAX_LOCAL_ATTEMPTS:
+                    if attempt >= MAX_CLUSTER_ATTEMPTS:
                         logger.error(
-                            f"Exhausted item retries. Moving to next sequence element."
+                            f"\U0001f6a8 Entire key cluster pool exhausted for "
+                            f"sequence {i + 1}. Skipping sample to preserve "
+                            "session state."
                         )
                         break
 
-                    # Honour the server-supplied retryDelay when present;
-                    # otherwise fall back to a short fixed pause (key rotation
-                    # already handles the quota pressure).
-                    sleep_duration = 2.0
-                    try:
-                        if hasattr(error, "details") and error.details:
-                            for detail in error.details:
-                                if "retryDelay" in detail and detail["retryDelay"]:
-                                    raw_delay_str = str(detail["retryDelay"])
-                                    cleaned_chars = [
-                                        ch
-                                        for ch in raw_delay_str
-                                        if ch.isdigit() or ch == "."
-                                    ]
-                                    if cleaned_chars:
-                                        sleep_duration = (
-                                            float("".join(cleaned_chars)) + 2.0
-                                        )
-                                        break
-                    except Exception as parse_err:
-                        logger.warning(
-                            f"Metadata extraction fallback triggered: {str(parse_err)}"
-                        )
-                        sleep_duration = 2.0
-
-                    logger.info(
-                        f"Rate-limit backoff initiated. "
-                        f"Sleeping pipeline for {sleep_duration}s..."
-                    )
-                    time.sleep(sleep_duration)
+                    # Tiny pause to let the socket clear before hitting the
+                    # new key channel — rotation already handles quota pressure
+                    time.sleep(0.2)
 
                 except Exception as gen_err:
                     attempt += 1
                     logger.error(
-                        f"Unexpected pipeline distortion: {str(gen_err)}"
+                        f"Parsing/Unexpected variance: {str(gen_err)}. "
+                        "Swapping key..."
                     )
-                    time.sleep(2.0)
+                    self._rotate_key()
+                    time.sleep(0.5)
 
-            # Post-iteration shift: clean context rotation for the next sample
-            self._rotate_key()
-
-            if success and i < num_samples - 1:
-                time.sleep(0.5)
+            # Post-item success rotation: balance request loading for the next
+            # element only when the current one succeeded
+            if success:
+                self._rotate_key()
+                if i < num_samples - 1:
+                    time.sleep(0.5)
 
         # ── Enrich every record with provenance metadata ──────────────────
         from datetime import datetime, timezone
