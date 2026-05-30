@@ -43,7 +43,7 @@ class SyntheticDataGenerator:
             base_url="https://openrouter.ai/api/v1",
             api_key=api_key,
         )
-        self.model_name = "openai/gpt-oss-20b:free"
+        self.model_name = "deepseek/deepseek-v4-flash:free"
 
         logger.info(
             f"OpenRouter client initialized. Active model channel: {self.model_name}"
@@ -154,7 +154,7 @@ class SyntheticDataGenerator:
                             f"Raw payload: {raw_text[:120]!r}"
                         )
 
-                    parsed_record = json.loads(cleaned_json)
+                    parsed_record = json.loads(cleaned_json, strict=False)
 
                     if isinstance(parsed_record, list):
                         if len(parsed_record) > 0:
